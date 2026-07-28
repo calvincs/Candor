@@ -686,7 +686,7 @@ class CandorSystem:
         if any(v >= 2 for v in sources.values()) and len(needed) >= 2:
             caveats.add("shared_provenance")
         return predict_mod.Problem(fid, dnf, states, groups, caveats, confusion,
-                                   response_lr)
+                                   response_lr, self._actor_discounts())
 
     def _fact_state(self, idx: Index, fact_id: str) -> predict_mod.FactState:
         row = idx.one("SELECT stmt_type, dispersion_flag, breadth_class FROM facts "
@@ -733,7 +733,32 @@ class CandorSystem:
     def fact_id_for(self, stmt: Mapping[str, Any]) -> Optional[str]:
         return facts_mod.lookup(self.index, stmt["pred"], list(stmt["args"]))
 
+    def _actor_discounts(self) -> dict[str, float]:
+        """Operator-set trust discounts for the crisp vote path.
+
+        Only *explicit* overrides count. Learned reliability lives in the
+        confusion ledger and already speaks through the two-coin LR; folding
+        E[rel] in as well would double-count the same settlements. An untouched
+        store returns {} and composes byte-identically to before this existed.
+        """
+        path = self.root / "reliability_overrides.json"
+        if not path.exists():
+            return {}
+        out: dict[str, float] = {}
+        for key, (a, b) in json.loads(path.read_text()).items():
+            actor, frame = key.split("|", 1)
+            if frame == reliability_mod.FACT_FRAME and (a + b) > 0:
+                out[actor] = float(a) / (float(a) + float(b))
+        return out
+
     def set_reliability(self, actor: str, frame: str, a: float, b: float) -> None:
+        """Operator override on a source's trust. Moves BOTH channels.
+
+        On frequency facts it discounts the aleatoric trial contribution; on
+        crisp facts it tempers the source's vote evidence (v0.3 Δ1 replaced the
+        epi Beta with two-coin votes, and before this the lever silently missed
+        them — see bench/CLAIMS_HARDENING.md F2).
+        """
         reliability_mod.set_reliability(self.index, actor, frame, a, b)
         path = self.root / "reliability_overrides.json"
         current = json.loads(path.read_text()) if path.exists() else {}

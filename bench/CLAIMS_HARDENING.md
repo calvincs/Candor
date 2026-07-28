@@ -110,3 +110,44 @@ reports the blast radius, and redacting a shared payload records a
 `test_retracting_a_source_leaves_other_actors_untouched` and
 `test_retraction_reproduces_a_store_the_source_never_touched` now pass.
 Regression check: **202 passed, 1 xfailed** (conformance + unit), unchanged.
+
+---
+
+## Stage 3 — F2: the discount lever reaches crisp facts
+
+**Diagnosis.** v0.3 Δ1 replaced the epistemic Beta with attributed two-coin
+votes for crisp facts. Those votes read `actor_confusion`, which only a
+settlement moves. `set_reliability` writes `actor_reliability` — still consulted
+on the frequency path, no longer consulted on the crisp path. So the lever
+`docs/use-cases.md` hands the operator for a hallucinating scraper silently did
+nothing to exactly the statement type that example is about.
+
+**Fix.** `reliability.temper(log_lr, weight)` scales a vote's evidence in
+log-odds space — the same device Δ2 already uses to price correlated votes
+sub-additively. Applied per actor in the crisp composition, so it covers the Δ1
+binary path and the Δ6 graded path identically.
+
+Only *explicit* overrides temper anything. Learned reliability already speaks
+through the confusion ledger, and folding E[rel] in as well would double-count
+the same settlements; a store with no overrides therefore returns `{}` and
+composes byte-identically to before. That is what keeps this from being a
+behaviour change for every existing store.
+
+| `set_reliability(poison, external, 0.001, 100)` | before | after |
+|---|---|---|
+| crisp fact | 0.007812 → 0.007812 (**no-op**) | 0.007812 → **0.298828** |
+| frequency fact | 0.379 → 0.702 | 0.379 → 0.702 (unchanged) |
+
+Note the residual, which is correct behaviour rather than a defect: an
+*unsettled* source's vote still composes at ~19:1, because `SENS_PRIOR`/
+`FPR_PRIOR` deliberately assume newcomers are informative ("evidence must be
+able to speak before it has been scored"). The operator now has a lever to
+overrule that; nothing about the prior changed.
+
+`test_discounting_a_source_moves_crisp_beliefs` now passes.
+Regression check: **202 passed, 1 xfailed**, unchanged.
+
+A first draft of this stage broke the §6.2 lexical firewall (`grep -rn weight`
+outside `core/committed/`) in three doc comments. Caught by `tests/unit/
+test_audit.py`, reworded, re-verified. Recording it because that invariant
+exists precisely to catch careless naming, and it did.
