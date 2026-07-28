@@ -111,8 +111,14 @@ class CandorSystem:
     def _refold(self) -> None:
         """Fold the whole log into a fresh index. Redaction implies exclusion."""
         redacted = self._redacted_payloads()
+        retracted = self._retracted_actors()
         for ev in self.ledger.read_all():
-            payload = (None if ev.payload_hash in redacted
+            # A retracted source keeps its event skeletons forever (nothing is
+            # erased) but contributes no payload, so every downstream number
+            # recomputes as if it never spoke. Retraction events themselves are
+            # always applied, or retracting an operator would be irreversible.
+            silenced = ev.actor in retracted and ev.kind != "retraction"
+            payload = (None if silenced or ev.payload_hash in redacted
                        else self.ledger.payload(ev.payload_hash))
             apply_mod.apply_event(self.index, ev, payload)
         self._apply_reliability_overrides()
@@ -130,6 +136,22 @@ class CandorSystem:
             payload = self.ledger.payload(ev.payload_hash)
             if payload:
                 out.add(payload["payload_hash"])
+        return out
+
+    def _retracted_actors(self) -> set[str]:
+        """Actors currently silenced. Folded in sequence order, so a later
+        restore reverses an earlier retraction without editing anything."""
+        out: set[str] = set()
+        for ev in self.ledger.read_all():
+            if ev.kind != "retraction":
+                continue
+            payload = self.ledger.payload(ev.payload_hash)
+            if not payload:
+                continue
+            if payload.get("restore"):
+                out.discard(payload["actor"])
+            else:
+                out.add(payload["actor"])
         return out
 
     def replay(self) -> str:
@@ -308,7 +330,52 @@ class CandorSystem:
             kind = "fact"
         return {"target_kind": kind, "target_id": target_id, "reason": reason}
 
+    def retract_source(self, actor: str, reason: str, restore: bool = False,
+                       authority: str = "human:operator") -> int:
+        """Silence one source. Every number it ever moved recomputes without it.
+
+        This — not `redact` — is how you recover from a bad source. Redaction
+        is keyed on a *content-addressed payload*, which by construction has no
+        actor in it: two sources reporting the same outcome on the same
+        statement in the same context share one payload, so redacting a liar's
+        hash also destroys the honest reports that agreed with it. Retraction
+        is keyed on the actor, so its blast radius is exactly one source.
+
+        Append-only and reversible: `restore=True` un-silences, and the whole
+        history stays in the chain either way.
+        """
+        payload = {"actor": actor, "reason": reason, "restore": bool(restore)}
+        ev = self.ledger.append("retraction", authority, payload)
+        self.index.reset()
+        self._refold()
+        self.closure()
+        return ev.seq
+
+    def redaction_scope(self, payload_hash: str) -> dict[str, Any]:
+        """Who would lose data if this payload were redacted (§3.13 blast radius).
+
+        Payloads are content-addressed and deduplicated, so a hash can be
+        shared by any number of actors. Call this before `redact` when the
+        intent is to purge a *source* rather than a piece of content — or use
+        `retract_source`, which cannot over-reach.
+        """
+        rows = self.index.query(
+            "SELECT actor, kind FROM events WHERE payload_hash=?", (payload_hash,))
+        actors = sorted({r["actor"] for r in rows})
+        return {"payload_hash": payload_hash, "events": len(rows),
+                "actors": actors, "shared": len(actors) > 1}
+
     def redact(self, payload_hash: str) -> int:
+        """Purge one payload's CONTENT everywhere it appears.
+
+        Scoped to content, not to a source: every event carrying this hash
+        loses its payload, whoever wrote it. See `redaction_scope` for the
+        blast radius, and `retract_source` to silence a single actor instead.
+        """
+        scope = self.redaction_scope(payload_hash)
+        if scope["shared"]:
+            apply_mod.diagnostic(self.index, 0, "redaction_shared_payload", scope)
+            self._health_events.append({"kind": "redaction_shared_payload", **scope})
         payload = {"payload_hash": payload_hash}
         ev = self.ledger.append("redaction", "human:operator", payload)
         apply_mod.apply_event(self.index, ev, payload)
@@ -619,7 +686,7 @@ class CandorSystem:
         if any(v >= 2 for v in sources.values()) and len(needed) >= 2:
             caveats.add("shared_provenance")
         return predict_mod.Problem(fid, dnf, states, groups, caveats, confusion,
-                                   response_lr)
+                                   response_lr, self._actor_discounts())
 
     def _fact_state(self, idx: Index, fact_id: str) -> predict_mod.FactState:
         row = idx.one("SELECT stmt_type, dispersion_flag, breadth_class FROM facts "
@@ -666,7 +733,32 @@ class CandorSystem:
     def fact_id_for(self, stmt: Mapping[str, Any]) -> Optional[str]:
         return facts_mod.lookup(self.index, stmt["pred"], list(stmt["args"]))
 
+    def _actor_discounts(self) -> dict[str, float]:
+        """Operator-set trust discounts for the crisp vote path.
+
+        Only *explicit* overrides count. Learned reliability lives in the
+        confusion ledger and already speaks through the two-coin LR; folding
+        E[rel] in as well would double-count the same settlements. An untouched
+        store returns {} and composes byte-identically to before this existed.
+        """
+        path = self.root / "reliability_overrides.json"
+        if not path.exists():
+            return {}
+        out: dict[str, float] = {}
+        for key, (a, b) in json.loads(path.read_text()).items():
+            actor, frame = key.split("|", 1)
+            if frame == reliability_mod.FACT_FRAME and (a + b) > 0:
+                out[actor] = float(a) / (float(a) + float(b))
+        return out
+
     def set_reliability(self, actor: str, frame: str, a: float, b: float) -> None:
+        """Operator override on a source's trust. Moves BOTH channels.
+
+        On frequency facts it discounts the aleatoric trial contribution; on
+        crisp facts it tempers the source's vote evidence (v0.3 Δ1 replaced the
+        epi Beta with two-coin votes, and before this the lever silently missed
+        them — see bench/CLAIMS_HARDENING.md F2).
+        """
         reliability_mod.set_reliability(self.index, actor, frame, a, b)
         path = self.root / "reliability_overrides.json"
         current = json.loads(path.read_text()) if path.exists() else {}

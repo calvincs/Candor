@@ -92,3 +92,75 @@ def test_transferability_is_capped_by_breadth_independently_of_count():
 def test_a_residual_with_no_shared_covariate_says_log_wider():
     assert "log wider" in C.suggested_measurement([])
     assert "elevation" in C.suggested_measurement(["elevation"])
+
+
+# ── exact changepoint routing (§4.4) ────────────────────────────────────────
+# The CUSUM alarm is normalised by sqrt(p(1-p)), a Gaussian approximation that
+# fails badly on skewed Bernoulli increments. These pin the exact replacement.
+
+def _fisher_reference(k1, n1, k2, n2):
+    """Exact-integer hypergeometric sum. Slow and obviously correct — the
+    log-space implementation has to match it, not the other way round."""
+    from math import comb
+    total_n, total_k = n1 + n2, k1 + k2
+    observed = comb(n1, k1) * comb(n2, total_k - k1)
+    return sum(comb(n1, x) * comb(n2, total_k - x)
+               for x in range(max(0, total_k - n2), min(n1, total_k) + 1)
+               if comb(n1, x) * comb(n2, total_k - x) <= observed) / comb(total_n, total_k)
+
+
+@pytest.mark.parametrize("table", [(1, 10, 11, 14), (5, 10, 5, 10),
+                                   (20, 20, 0, 20), (54, 60, 6, 60),
+                                   (8, 9, 1, 40)])
+def test_fisher_exact_matches_an_exact_integer_reference(table):
+    assert C.fisher_exact(*table) == pytest.approx(_fisher_reference(*table),
+                                                   rel=1e-9)
+
+
+def test_changepoint_significance_is_flat_across_base_rates():
+    """The defect that motivated this: the old inner CUSUM false-alarmed on
+    40% of stationary p=0.95 segments and 3% at p=0.5. An exact test must not
+    care what the base rate is."""
+    for p in (0.05, 0.1, 0.5, 0.9, 0.95):
+        rng = random.Random(hash(p) & 0xFFFF)
+        fires = sum(C.changepoint_test([rng.random() < p for _ in range(120)])
+                    is not None for _ in range(200))
+        assert fires / 200 <= 0.05, f"stationary p={p} alarmed {fires}/200"
+
+
+def test_a_real_step_is_found_and_located():
+    rng = random.Random(4)
+    errors = []
+    for _ in range(100):
+        s = [rng.random() < 0.9 for _ in range(60)] + \
+            [rng.random() < 0.1 for _ in range(60)]
+        found = C.changepoint_test(s)
+        assert found is not None, "missed an unmissable 0.9 -> 0.1 break"
+        errors.append(abs(found[0] - 59))
+    errors.sort()
+    assert errors[len(errors) // 2] <= 2, f"median localization {errors}"
+    assert errors[int(0.9 * len(errors))] <= 5, "p90 localization degraded"
+
+
+def test_oscillation_never_becomes_a_regime_change():
+    """The routing contract, not the internals: a flapping service must not
+    yield a supersede, whether because no split is significant or because the
+    split it finds recurs."""
+    proposals = 0
+    for seed in range(100):
+        rng = random.Random(seed)
+        s = [rng.random() < (0.85 if (i // 20) % 2 else 0.35) for i in range(240)]
+        found = C.changepoint_test(s)
+        if found is not None and not C.is_recurrent(s):
+            proposals += 1
+    assert proposals <= 5, f"{proposals}/100 flapping series read as a break"
+
+
+def test_a_clean_step_is_not_recurrent():
+    rng = random.Random(8)
+    clean = 0
+    for _ in range(50):
+        s = [rng.random() < 0.95 for _ in range(60)] + \
+            [rng.random() < 0.05 for _ in range(60)]
+        clean += not C.is_recurrent(s)
+    assert clean >= 45, f"recurrence veto ate {50 - clean}/50 genuine steps"

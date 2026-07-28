@@ -62,9 +62,18 @@ counted, the pin holds, and past a threshold a human gets paged via
 `questions()`). Supersede reverses anything — facts, aliases, pins — by
 appending, never by editing.
 
+### `retract_source(actor, reason, restore=False) -> event_seq`
+Silences one source. Its event skeletons stay in the chain; they stop
+contributing, and every downstream number — counts, trust, predictions —
+recomputes as if it never spoke. Append-only and reversible. **This is how you
+recover from a bad source.**
+
 ### `redact(payload_hash) -> event_seq`
 Deletes a payload; the chain still verifies; replay recomputes all state
-without the content. This is how you purge a bad or sensitive source.
+without the content. Scoped to *content*, not to a source: payloads are
+content-addressed and carry no actor, so every event sharing the hash loses its
+payload whoever wrote it. Use it for secrets and PII, check
+`redaction_scope(payload_hash)` first, and use `retract_source` for a bad actor.
 
 ## Reading
 

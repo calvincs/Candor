@@ -8,8 +8,13 @@ are needed only to run the test suite.
 ```sh
 make venv          # creates .venv and installs the test deps
 make gates         # stage1..stage5 conformance gates — should all be green
-make unit          # 180 additive unit tests
+make unit          # 194 additive unit tests
+make claims        # 34 claims tests: the README, measured on synthetic worlds
 ```
+
+`make claims-fast` skips the prediction-heavy tests (~45s instead of ~2m30s),
+and `CLAIMS_SCALE=4 make claims` raises the replication count when you want to
+investigate a threshold rather than just check it.
 
 To use CANDOR from your own code, put `src/` on your path (or install it as a
 package) — there is nothing to compile and nothing to download.
@@ -82,6 +87,13 @@ signature behaviours.
   allowed to promote themselves.
 - **Deleting `index.sqlite3` loses nothing.** It is a derived view; `replay()`
   rebuilds it bit-for-bit from the ledger segments.
+- **To undo a bad source, use `retract_source`, not `redact`.** Payloads are
+  content-addressed and carry no actor, so two sources reporting the same
+  outcome on the same statement share one — and `redact` purges *content*,
+  meaning it takes the honest reports with it. `retract_source` is scoped to
+  the actor, is reversible, and recomputes every downstream number as if that
+  source had never spoken. `redact` is for secrets and PII; check
+  `redaction_scope()` before firing it.
 - **Quotas are on by default.** An actor that floods observations or spams the
   gate hits its per-epoch quota and gets a `QuotaExceeded` — provision with
   `set_actor_quota()` for legitimate bulk loads.

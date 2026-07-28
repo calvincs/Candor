@@ -104,14 +104,24 @@ A sweep over the observation log that treats instability as information:
   support, an MDL check, and held-out validation at the gate. High-cardinality
   keys can flag a problem but can never become guards — an m-ary lookup table
   is not a condition.
-- **One-way change** (CUSUM, with the changepoint located at the argmax of
-  cumulative deviation, plus a recurrence check so oscillation isn't mistaken
-  for a step) → a *supersede-with-valid-time* candidate: the old regime keeps
-  its counts and its dates; the successor starts fresh. This is the
-  substrate's answer to recency: **age isn't decay, it's regimes.**
+- **One-way change** — located at the argmax of cumulative deviation (median
+  error 1 observation in 120), then tested with a two-sided Fisher exact
+  p-value corrected for the split positions searched, plus the same test inside
+  each segment so oscillation isn't mistaken for a step. Exactness earns its
+  keep here: a CUSUM normalised by `sqrt(p(1-p))` is a Gaussian approximation,
+  and skewed Bernoulli increments made the previous version fire on 40% of
+  *stationary* p=0.95 segments while eating most real breaks. Survivors become a
+  *supersede-with-valid-time* candidate carrying the located date; the old
+  regime keeps its counts and its dates, the successor starts fresh, and the
+  gate checks the date, the per-side support and the significance like any other
+  candidate. This is the substrate's answer to recency: **age isn't decay, it's
+  regimes.**
 - **Detected but unexplained** → an open question with the residual partition
-  and a concrete suggested measurement. When a new covariate starts being
-  recorded later, open questions are re-tested against it automatically.
+  and a concrete suggested measurement. Instability is tested on the time axis
+  as well as across covariates, so a stream that swings with *nothing useful
+  logged* is told "log wider" instead of getting silence. When a new covariate
+  starts being recorded later, open questions are re-tested against it
+  automatically.
 
 ## Spec lineage
 

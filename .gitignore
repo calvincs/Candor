@@ -6,3 +6,21 @@ __pycache__/
 # All benchmark/run data stays local: corpora and observation streams are
 # derived from private sources and must never be committed.
 data/
+corpus_sources/
+
+# A CANDOR store is derived state, and it is also the most likely way private
+# data reaches a public repo by accident: every store carries an index.sqlite3
+# and a retrieval.sqlite3 built from whatever it ingested, and the quickstart
+# in README.md writes one to ./store in the repo root. Ignore these by shape,
+# not just by location, so a store created anywhere is covered.
+*.sqlite
+*.sqlite3
+*.db
+*-journal
+*-wal
+*-shm
+store/
+
+# Extracted observation streams and corpora (bench/ingest_pernix.py,
+# bench/corpus.py). Nothing derived from private memories is committable.
+*.jsonl

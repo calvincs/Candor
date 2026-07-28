@@ -23,11 +23,17 @@ CREATE TABLE IF NOT EXISTS events(
   seq INTEGER PRIMARY KEY, ts INTEGER NOT NULL,
   kind TEXT NOT NULL CHECK(kind IN
     ('assertion','observation','supersede','admission','demotion','pin','claim',
-     'resolution','alias','redaction','checkpoint')),
+     'resolution','alias','redaction','retraction','checkpoint')),
   actor TEXT NOT NULL, payload_hash TEXT NOT NULL, source_ref TEXT,
   context_sig TEXT, prev_hash TEXT NOT NULL, hash TEXT NOT NULL);
 
 CREATE TABLE IF NOT EXISTS redactions(payload_hash TEXT PRIMARY KEY, event_seq INTEGER);
+-- Source retraction: silences an ACTOR, where redaction purges a PAYLOAD.
+-- Distinct because payloads are content-addressed and carry no actor, so
+-- honest sources reporting the same outcome share a hash with a liar.
+CREATE TABLE IF NOT EXISTS retractions(
+  actor TEXT PRIMARY KEY, event_seq INTEGER NOT NULL, reason TEXT,
+  restored INTEGER NOT NULL DEFAULT 0);
 
 -- ── ACTORS & RELIABILITY ─────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS actors(

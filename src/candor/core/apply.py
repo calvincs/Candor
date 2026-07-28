@@ -282,6 +282,16 @@ def _apply_redaction(idx: "Index", ev: "Event", payload: dict[str, Any]) -> None
                 "VALUES(?,?)", (payload["payload_hash"], ev.seq))
 
 
+def _apply_retraction(idx: "Index", ev: "Event", payload: dict[str, Any]) -> None:
+    """Record that a source was silenced (or restored). The *exclusion* itself
+    happens at fold time in `CandorSystem._refold`; this is the audit trail."""
+    idx.execute(
+        "INSERT OR REPLACE INTO retractions(actor, event_seq, reason, restored) "
+        "VALUES(?,?,?,?)",
+        (payload["actor"], ev.seq, payload.get("reason"),
+         1 if payload.get("restore") else 0))
+
+
 def _apply_checkpoint(idx: "Index", ev: "Event", payload: dict[str, Any]) -> None:
     idx.execute("INSERT OR REPLACE INTO diagnostics(ts, kind, detail_json) "
                 "VALUES(?,?,?)", (ev.ts, "checkpoint", canon_json(payload)))
@@ -298,6 +308,7 @@ _HANDLERS = {
     "claim": _apply_claim,
     "resolution": _apply_resolution,
     "redaction": _apply_redaction,
+    "retraction": _apply_retraction,
     "checkpoint": _apply_checkpoint,
 }
 

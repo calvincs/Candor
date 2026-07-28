@@ -107,6 +107,21 @@ def log_lr(sens: float, fpr: float, vote: bool) -> float:
     return math.log((1.0 - sens) / (1.0 - fpr))
 
 
+def temper(log_lr_value: float, weight: float) -> float:
+    """Scale one vote's evidence by an operator-set trust weight.
+
+    The lever behind `set_reliability`. A weight of 1.0 leaves the vote exactly
+    as its confusion ledger earned it; 0.0 silences it (LR = 1, no information);
+    0.8 means "count this source's evidence at 80% strength". Same device the
+    Δ2 correlation discount already uses — evidence is tempered in log-odds
+    space, never by editing a stored count (I11).
+
+    Applies to any log-LR whatever its provenance, so the Δ1 binary path and
+    the Δ6 graded path discount identically.
+    """
+    return log_lr_value * max(0.0, min(1.0, weight))
+
+
 def grouped_logodds(votes, params, prior_logodds: float = 0.0,
                     gamma: float = GAMMA) -> float:
     """Δ2 composition: votes grouped by context signature, sub-additive within.

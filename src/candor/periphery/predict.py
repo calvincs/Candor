@@ -26,7 +26,7 @@ from typing import Any, Iterable, Optional, Sequence
 
 from ..core.betamath import beta_mean, beta_quantile_grid
 from ..core.committed.reliability import (FPR_PRIOR, GAMMA, SENS_PRIOR,
-                                          log_lr)
+                                          log_lr, temper)
 from ..core.hashing import stable_u64
 
 DEFAULT_SAMPLES = 512
@@ -60,6 +60,9 @@ class Problem:
     confusion: dict[str, tuple[int, int, int, int]] = field(default_factory=dict)
     # v0.4 Δ6: mean log-LR per graded response (actor, vote, grade), read-time.
     response_lr: dict[tuple[str, int, int], float] = field(default_factory=dict)
+    # Operator-set trust discounts (set_reliability). Absent = 1.0 = untempered,
+    # so a store with no overrides composes exactly as it did before.
+    discounts: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -139,7 +142,8 @@ def _actor_param_grids(problem: Problem, s: int) -> dict[str, tuple[list[float],
 
 def _draw(state: FactState, s: int,
           actor_params: Optional[dict[str, tuple[list[float], list[float]]]] = None,
-          response_lr: Optional[dict] = None) -> _Draws:
+          response_lr: Optional[dict] = None,
+          discounts: Optional[dict[str, float]] = None) -> _Draws:
     if state.pinned_negative:
         # A '-' pin is the only hard zero in the system (I5).
         return _Draws([0] * s, [0.0] * s)
@@ -160,6 +164,8 @@ def _draw(state: FactState, s: int,
                 else:
                     contribution = log_lr(actor_params[actor][0][i],
                                           actor_params[actor][1][i], bool(vote))
+                if discounts:
+                    contribution = temper(contribution, discounts.get(actor, 1.0))
                 if sig is None:
                     singles += contribution
                 else:
@@ -242,7 +248,7 @@ def run(problem: Problem, budget: int) -> Outcome:
     s = max(MIN_SAMPLES, s)
 
     actor_params = _actor_param_grids(problem, s)
-    draws = {fid: _draw(st, s, actor_params, problem.response_lr)
+    draws = {fid: _draw(st, s, actor_params, problem.response_lr, problem.discounts)
              for fid, st in problem.facts.items()}
     groups = [[f for f in g if f in draws] for g in problem.constraint_groups]
     groups = [g for g in groups if len(g) > 1]

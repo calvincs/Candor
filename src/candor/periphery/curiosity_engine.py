@@ -43,8 +43,9 @@ def sweep(idx) -> list[tuple[str, dict[str, Any]]]:
         "ORDER BY f.id")
     for fact in facts:
         rows = idx.query(
-            "SELECT event_seq, outcome FROM observations WHERE fact_id=? "
-            "ORDER BY event_seq", (fact["id"],))
+            "SELECT o.event_seq, o.outcome, e.ts FROM observations o "
+            "JOIN events e ON e.seq = o.event_seq WHERE o.fact_id=? "
+            "ORDER BY o.event_seq", (fact["id"],))
         if len(rows) < MIN_OBS:
             continue
         series = [bool(r["outcome"]) for r in rows]
@@ -87,26 +88,15 @@ def sweep(idx) -> list[tuple[str, dict[str, Any]]]:
                 winner = (key, usable, mdl)
                 break
 
-        changepoint = C.cusum_changepoint(series)
-        # §4.4 routing: a regime change is ONE-WAY. The CUSUM *alarm* can fire
-        # inside the first regime (the global mean straddles), so locate the
-        # change at the argmax of cumulative deviation, then ask whether the
-        # tail beyond it changes AGAIN — if so, the series oscillates, which is
-        # dispersion wearing a changepoint costume, and the repair is a
-        # condition, not a supersede.
-        recurrent = False
-        if changepoint is not None:
-            mean = sum(1 for x in series if x) / len(series)
-            running, peak, located = 0.0, -1.0, 0
-            for i, x in enumerate(series):
-                running += (1.0 if x else 0.0) - mean
-                if abs(running) > peak:
-                    peak, located = abs(running), i
-            changepoint = located
-            # a true step leaves two internally-stable halves; oscillation
-            # leaves at least one half that changes again
-            recurrent = (C.cusum_changepoint(series[:located]) is not None
-                         or C.cusum_changepoint(series[located + 1:]) is not None)
+        # §4.4 routing: a regime change is ONE-WAY. Locate the shift at the
+        # argmax of cumulative deviation, test it exactly against the search
+        # that found it, then ask whether either side changes AGAIN — if so the
+        # series oscillates, which is dispersion wearing a changepoint costume,
+        # and the repair is a condition or a question, never a supersede.
+        detected = C.changepoint_test(series)
+        changepoint = detected[0] if detected else None
+        changepoint_p = detected[1] if detected else None
+        recurrent = C.is_recurrent(series) if detected else False
 
         if winner is not None:
             key, usable, mdl = winner
@@ -136,19 +126,43 @@ def sweep(idx) -> list[tuple[str, dict[str, Any]]]:
                         (fact["id"],))
             _open_question(idx, fact["id"], usable, key)
         elif changepoint is not None and not recurrent:
+            # The whole point of locating a changepoint is to record WHEN the
+            # old regime stopped holding. Carry the located observation's own
+            # timestamp, or the commit stamps the sweep's wall clock instead
+            # and the located date is thrown away (F3).
             proposals.append(("supersede_valid_time", {
                 "fact_id": fact["id"], "changepoint_index": changepoint,
-                "reason": "CUSUM regime change, no explaining covariate",
+                "valid_to": int(rows[changepoint]["ts"]),
+                "changepoint_event_seq": int(rows[changepoint]["event_seq"]),
+                "support": {"before": changepoint + 1,
+                            "after": len(series) - changepoint - 1},
+                "pvalue": changepoint_p,
+                "reason": "one-way level change, no explaining covariate",
             }))
-        # under-explained overdispersion without a passing guard: flag + ask
-        if winner is None and (changepoint is None or recurrent) and tested:
+        # Under-explained instability: nothing was guarded and no single date
+        # accounts for it. Two independent grounds to speak, either sufficient —
+        # a recorded covariate that clusters the variance without clearing the
+        # guard bar, or dispersion on the time axis itself, which needs no
+        # covariate at all. Requiring the former was the whole defect: an agent
+        # that logged nothing relevant was told nothing (F5).
+        if winner is None and (changepoint is None or recurrent):
             z_any = max((C.tarone_z(list(u.values())) or 0.0)
-                        for _, u, _, _ in tested)
-            if z_any > C.TARONE_Z_THRESHOLD:
+                        for _, u, _, _ in tested) if tested else 0.0
+            by_covariate = z_any > C.TARONE_Z_THRESHOLD
+            over_time = C.temporal_dispersion(series)
+            if by_covariate or over_time is not None:
                 idx.execute("UPDATE facts SET dispersion_flag=1 WHERE id=?",
                             (fact["id"],))
-                _open_question(idx, fact["id"], tested[0][1], None,
-                               ruled_out=[t[0] for t in tested])
+                if by_covariate:
+                    residual, ruled_out = tested[0][1], [t[0] for t in tested]
+                else:
+                    # The residual partition IS the time blocks: "it is unstable
+                    # across these stretches and nothing you logged says why."
+                    residual = {f"t{i}": g
+                                for i, g in enumerate(over_time[2])}
+                    ruled_out = [t[0] for t in tested]
+                _open_question(idx, fact["id"], residual, None,
+                               ruled_out=ruled_out)
 
         # §4.6 breadth over confirming observations
         confirming = {k: [ctx[k] for ctx, out in obs if out and k in ctx]

@@ -22,3 +22,5 @@ def pytest_configure(config):
     for m in ("stage1", "stage2", "stage3", "stage4", "stage5",
               "fail_stop", "alert_only"):
         config.addinivalue_line("markers", f"{m}: CANDOR conformance tag (spec §6)")
+    for m in ("claims", "slow"):
+        config.addinivalue_line("markers", f"{m}: claims suite tag (tests/claims)")

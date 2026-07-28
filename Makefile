@@ -1,7 +1,7 @@
 PY ?= .venv/bin/python
 PYTEST = $(PY) -m pytest
 
-.PHONY: help venv unit conformance stage1 stage2 stage3 stage4 stage5 gates audit clean examples
+.PHONY: help venv unit conformance stage1 stage2 stage3 stage4 stage5 gates audit clean examples claims claims-fast all-tests
 
 help:
 	@echo "CANDOR — spec v0.2 conformance targets"
@@ -9,6 +9,7 @@ help:
 	@echo "  make stage1..5    run one §6.7 stage gate"
 	@echo "  make gates        run stage1..stage4 in build order, stopping at the first red"
 	@echo "  make unit         additive unit suite (tests/unit)"
+	@echo "  make claims       validate the public claims on synthetic worlds"
 	@echo "  make conformance  the whole harness"
 	@echo "  make audit        the two source-tree invariants (§6.2)"
 
@@ -37,6 +38,16 @@ gates: stage1 stage2 stage3 stage4
 
 unit:
 	$(PYTEST) tests/unit
+
+# §6.9 claims suite: the public promises, measured on planted synthetic worlds.
+# CLAIMS_SCALE raises the replication count (1 = CI-sized, 4-8 = investigation).
+claims:
+	$(PYTEST) tests/claims -q
+
+claims-fast:
+	$(PYTEST) tests/claims -q -m "not slow"
+
+all-tests: gates stage5 unit claims
 
 conformance:
 	$(PYTEST) tests/conformance.py

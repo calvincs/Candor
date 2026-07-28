@@ -29,12 +29,13 @@ SEGMENT_LINES = 4096
 # Kinds admitted to the chain (spec §2 `events.kind` CHECK constraint).
 EVENT_KINDS = frozenset({
     "assertion", "observation", "supersede", "admission", "demotion",
-    "pin", "claim", "resolution", "alias", "redaction", "checkpoint",
+    "pin", "claim", "resolution", "alias", "redaction", "retraction", "checkpoint",
 })
 
 # §3.1 durability: structural events fsync immediately, observations may batch.
 DURABLE_KINDS = frozenset({
-    "admission", "resolution", "pin", "supersede", "alias", "redaction", "checkpoint",
+    "admission", "resolution", "pin", "supersede", "alias", "redaction",
+    "retraction", "checkpoint",
 })
 
 

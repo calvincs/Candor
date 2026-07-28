@@ -324,3 +324,81 @@ Three choices the spec leaves open, made and tested in `periphery/curiosity_engi
    question (the repair is a condition, not a regime).
 Held-out validation for discovered guards (§3.4 step 5) splits observations by
 event parity: even indices discover, odd indices validate direction.
+
+### D21 — source retraction is a first-class event, distinct from redaction
+The spec gives one purge primitive, `redaction`, keyed on a payload hash.
+Payloads are content-addressed and carry no actor, so two sources reporting the
+same outcome on the same statement in the same context share one payload:
+redacting a liar's hashes destroys the honest reports that agreed with it
+(measured: 185 of 600 honest observations). Since multi-source agreement is the
+situation the substrate exists to reason about, the documented recovery path was
+most destructive exactly where it mattered.
+
+A `retraction` event kind is added, keyed on the **actor**. Exclusion happens at
+fold time: the retracted actor's event skeletons stay in the chain forever
+(nothing is erased, I3 holds) but contribute no payload, so every downstream
+number — including trust, since `_apply_resolution` re-scores on replay —
+recomputes as if the source never spoke. Append-only and reversible
+(`restore=True`); last write per actor wins. `redact` keeps its content-purging
+meaning, which is a real and separate need, and now reports its blast radius via
+`redaction_scope` plus a diagnostic when a payload is shared.
+Evidence: `bench/CLAIMS_HARDENING.md` Stage 2.
+
+### D22 — operator reliability overrides temper the crisp vote path
+v0.3 Δ1 replaced the epistemic Beta with attributed two-coin votes for crisp
+facts, which read `actor_confusion` (settlement-moved only). `set_reliability`
+writes `actor_reliability`, so after Δ1 the operator's discount lever silently
+did nothing to crisp facts — the statement type `docs/use-cases.md` uses it on.
+An explicit override now also tempers each of that actor's votes in log-odds
+space (`reliability.temper`), the same device Δ2 uses to price correlated votes
+sub-additively. Only *explicit* overrides temper: learned reliability already
+speaks through the confusion ledger, and folding E[rel] in as well would
+double-count the same settlements, so a store with no overrides composes
+byte-identically to before. Evidence: `bench/CLAIMS_HARDENING.md` Stage 3.
+
+### D23 — changepoint significance is exact, and the supersede is gated
+Supersedes D20.3. CUSUM normalises its alarm by `sqrt(p(1-p))`, a Gaussian
+approximation; Bernoulli increments are badly skewed near 0 and 1, so the
+recurrence discriminator false-alarmed on 40% of *stationary* p=0.95 segments
+against 3% at p=0.5, destroying 64% of genuine 0.95→0.05 breaks — the failure
+was worst in the broken-tool regime the feature exists for.
+
+Localization is unchanged (argmax of cumulative deviation, median error 1
+observation in 120). The significance decision around it is now
+`fisher_exact` — a two-sided hypergeometric p-value in log space, exact at any
+base rate — Bonferroni-corrected by the number of split positions searched,
+with the same machinery applied inside each segment for recurrence.
+
+`supersede_valid_time` was also the only candidate kind the gate admitted
+unconditionally, so periphery false positives became committed history. It now
+runs steps 1/5/6: the fact must exist, the proposal must carry a located
+`valid_to` (a regime change that cannot say *when* is not one), both regimes
+need ≥`GUARD_MIN_SUPPORT` observations, and the level change must clear
+`SUPERSEDE_ALPHA` after correction — tighter than the guard's BH α, because a
+false supersede rewrites history while a false guard is only a rejected
+candidate. The located date is now carried in the body and committed, where
+`apply` previously fell back to the sweep's own wall clock.
+Evidence: `bench/CLAIMS_HARDENING.md` Stages 4-5.
+
+### D24 — Tarone's Z denominator corrected; instability is detectable without a covariate
+Two changes to §4.5 dispersion, one a bug fix and one a gap.
+
+**The statistic.** `tarone_z` multiplied its denominator by `p/(1-p)`, which is
+not part of Tarone's Z (the null standard deviation of the chi-square term is
+`sqrt(2 Σ nᵢ(nᵢ-1))` and carries no p). Measured false-discovery rate on
+covariate splits with no real effect, BH at 0.05: **0.407 at a 5% base rate**,
+0.263 at 10%, 0.000 at 90%. An ordinary mostly-failing scraper was handed a
+fabricated "works when X" 41% of the time. Corrected, the rate is flat at
+3.5-6.8% across p ∈ [0.05, 0.95] and the statistic is *more* powerful on real
+structure, so nothing was traded for the calibration.
+
+**The gap.** The flag/question branch required some *recorded covariate* to be
+overdispersed, so a stream swinging 85%/35% with nothing useful logged produced
+no signal at all — while the time axis had already detected the instability and
+the routing discarded it. `suggested_measurement([])` ("log wider: the missing
+argument was never captured") was unreachable. `temporal_dispersion` now tests
+overdispersion across contiguous time blocks at several scales, corrected for
+the scales tried; it needs no covariate because the variance is visible in the
+series itself. The routing speaks on either ground, and for the temporal case
+the residual partition *is* the time blocks.
+Evidence: `bench/CLAIMS_HARDENING.md` Stage 6.

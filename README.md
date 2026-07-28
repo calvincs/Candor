@@ -74,7 +74,8 @@ print(p.p, p.ci, p.snapshot_id)   # a real probability, reproducible from its sn
 | `src/candor/core/` | Trusted core: ledger, gate, closure, counts, calibration (stdlib-only) |
 | `src/candor/periphery/` | Untrusted periphery: retrieval, prediction, extraction, curiosity |
 | `tests/conformance.py` | The executable spec — 23 conformance tests across 5 stage gates |
-| `tests/unit/` | 180 additive tests |
+| `tests/unit/` | 194 additive tests |
+| `tests/claims/` | The executable README — every claim on this page, measured on synthetic worlds with planted truth and null controls (`make claims`) |
 | `bench/` | The pre-registered honest-test harness and its findings |
 | `DEVIATIONS.md` | Every place the build interprets, extends, or argues with the spec |
 
@@ -100,9 +101,17 @@ failures and what each one taught, is in [docs/benchmarks.md](docs/benchmarks.md
 
 ## Status
 
-Fully conformant against the spec through Stage 5 (all gates green: 202 tests
-+ 1 xfail-by-design). Spec v0.2 plus adopted deltas v0.3/v0.4. Single-writer,
-single-box by design — distributed consensus is an explicit non-goal for v1.
+Fully conformant against the spec through Stage 5 (all gates green: 216 tests
++ 1 xfail-by-design), plus 34 claims tests holding this page to its word. Spec
+v0.2 plus adopted deltas v0.3/v0.4. Single-writer, single-box by design —
+distributed consensus is an explicit non-goal for v1.
+
+Six defects have been found by the claims suite and fixed, each recorded with
+before/after measurements in [bench/CLAIMS_HARDENING.md](bench/CLAIMS_HARDENING.md)
+— including a purge path that destroyed honest observations along with the bad
+source, and an overdispersion statistic that fabricated conditions for
+mostly-failing tools 41% of the time. Conformance passing is not the same as
+the README being true, which is why the second suite exists.
 
 ## License
 

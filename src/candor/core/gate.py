@@ -78,7 +78,7 @@ def evaluate(idx: "Index", cid: str, kind: str, body: dict[str, Any],
     if kind in ("rule", "guard"):
         return _evaluate_rule(idx, cid, kind, body)
     if kind == "supersede_valid_time":
-        return Decision(cid, kind, "admitted", body=body)
+        return _evaluate_supersede(idx, cid, body)
     return _reject(cid, kind, 1, f"unknown candidate kind {kind!r}")
 
 
@@ -223,6 +223,40 @@ def _evaluate_rule(idx: "Index", cid: str, kind: str,
                            f"MDL: {cost:.3f} !< {base:.3f}, guard costs more than "
                            f"it compresses")
     return Decision(cid, kind, "admitted", body=body)
+
+
+#: A supersede closes a fact's validity window, so it is held to the same
+#: evidentiary bar as any other structural change. It was previously the only
+#: candidate kind admitted unconditionally, which meant a periphery
+#: false-positive became committed history with nothing in the way (F4).
+SUPERSEDE_ALPHA = 0.01
+
+
+def _evaluate_supersede(idx: "Index", cid: str, body: dict[str, Any]) -> Decision:
+    """Steps 1/5/6 for a located regime change."""
+    fact_id = body.get("fact_id")
+    if not fact_id:
+        return _reject(cid, "supersede_valid_time", 1,
+                       "supersede candidate names no fact")
+    if idx.one("SELECT id FROM facts WHERE id=?", (fact_id,)) is None:
+        return _reject(cid, "supersede_valid_time", 1,
+                       f"supersede targets unknown fact {fact_id!r}")
+    if body.get("valid_to") is None:
+        return _reject(cid, "supersede_valid_time", 5,
+                       "no located date: a regime change that cannot say WHEN "
+                       "is not a regime change")
+    support = body.get("support") or {}
+    thin = min(int(support.get("before", 0)), int(support.get("after", 0)))
+    if thin < GUARD_MIN_SUPPORT:
+        return _reject(cid, "supersede_valid_time", 5,
+                       f"regime support below {GUARD_MIN_SUPPORT} observations "
+                       f"per side (thinnest side {thin})")
+    pvalue = body.get("pvalue")
+    if pvalue is None or float(pvalue) > SUPERSEDE_ALPHA:
+        return _reject(cid, "supersede_valid_time", 6,
+                       f"level change not significant after correcting for the "
+                       f"searched changepoint (p={pvalue})")
+    return Decision(cid, "supersede_valid_time", "admitted", body=body)
 
 
 # ── shared checks ───────────────────────────────────────────────────────────
