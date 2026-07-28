@@ -21,6 +21,11 @@ TARONE_Z_THRESHOLD = 3.0
 CUSUM_THRESHOLD = 5.0
 CUSUM_DRIFT = 0.5
 BH_ALPHA = 0.05
+# §4.4 changepoint significance, after correcting for the searched split point.
+# Deliberately tighter than BH_ALPHA: a supersede closes a fact's validity
+# window, so a false one rewrites history, while a false guard is only a
+# rejected candidate.
+CHANGEPOINT_ALPHA = 0.01
 
 
 @dataclass(frozen=True)
@@ -87,6 +92,95 @@ def cusum_changepoint(series: Sequence[bool], threshold: float = CUSUM_THRESHOLD
         if hi > alarm or lo < -alarm:
             return i
     return None
+
+
+def _lchoose(n: int, k: int) -> float:
+    if k < 0 or k > n or n < 0:
+        return float("-inf")
+    return (math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma(n - k + 1))
+
+
+def fisher_exact(k1: int, n1: int, k2: int, n2: int) -> float:
+    """Two-sided Fisher exact p for a success/failure table over two segments.
+
+    Exact at every base rate, which is the whole reason it is here. A CUSUM
+    normalised by sqrt(p(1-p)) is a Gaussian approximation, and Bernoulli
+    increments are badly skewed near 0 and 1: the old changepoint machinery
+    false-alarmed on 40% of *stationary* p=0.95 segments and 43% at p=0.05,
+    against 3% at p=0.5 — worst precisely in the broken-tool regime a memory
+    substrate exists to notice. Computed in log space so the binomials stay
+    cheap on long series.
+    """
+    if n1 <= 0 or n2 <= 0:
+        return 1.0
+    total_n, total_k = n1 + n2, k1 + k2
+    denom = _lchoose(total_n, total_k)
+    if denom == float("-inf"):
+        return 1.0
+    observed = _lchoose(n1, k1) + _lchoose(n2, total_k - k1) - denom
+    acc = 0.0
+    for x in range(max(0, total_k - n2), min(n1, total_k) + 1):
+        lp = _lchoose(n1, x) + _lchoose(n2, total_k - x) - denom
+        if lp <= observed + 1e-9:
+            acc += math.exp(lp)
+    return min(1.0, acc)
+
+
+def locate_changepoint(series: Sequence[bool]) -> int:
+    """Index of the last observation before the biggest shift in level.
+
+    argmax of |cumulative deviation from the series mean|. This part was always
+    good — median localization error is 1 observation in 120 — so it is kept
+    verbatim and only the *significance* decision around it was replaced.
+    """
+    n = len(series)
+    mean = sum(1 for x in series if x) / n
+    running, peak, located = 0.0, -1.0, 0
+    for i, x in enumerate(series):
+        running += (1.0 if x else 0.0) - mean
+        if abs(running) > peak:
+            peak, located = abs(running), i
+    return located
+
+
+def changepoint_test(series: Sequence[bool],
+                     alpha: float = CHANGEPOINT_ALPHA
+                     ) -> Optional[tuple[int, float]]:
+    """(index, corrected p) for a step change in level, or None.
+
+    The split point is chosen by maximising over every admissible position, so
+    the naive p-value is anti-conservative by exactly that search. Correcting
+    for the number of positions searched is what holds the false-positive rate
+    near alpha at any base rate.
+    """
+    n = len(series)
+    if n < 2 * MIN_SUPPORT_PER_PARTITION:
+        return None
+    idx = locate_changepoint(series)
+    n1 = idx + 1
+    n2 = n - n1
+    if min(n1, n2) < MIN_SUPPORT_PER_PARTITION:
+        return None
+    k1 = sum(1 for x in series[:n1] if x)
+    k2 = sum(1 for x in series[n1:] if x)
+    searched = max(1, n - 2 * MIN_SUPPORT_PER_PARTITION + 1)
+    p = min(1.0, fisher_exact(k1, n1, k2, n2) * searched)
+    return (idx, p) if p <= alpha else None
+
+
+def is_recurrent(series: Sequence[bool],
+                 alpha: float = CHANGEPOINT_ALPHA) -> bool:
+    """Does either side of the located split change AGAIN?
+
+    A one-way regime change leaves two internally homogeneous segments; a
+    flapping service or an outage that recovered does not. §4.4 routes the
+    second kind to a condition or a question, never to a supersede — so this
+    check decides whether a detection is a *date* or a *symptom*, and it has to
+    be right at extreme base rates or it eats the true detections.
+    """
+    idx = locate_changepoint(series)
+    return (changepoint_test(series[:idx + 1], alpha) is not None
+            or changepoint_test(series[idx + 1:], alpha) is not None)
 
 
 def benjamini_hochberg(pvalues: Sequence[float],

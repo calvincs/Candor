@@ -154,3 +154,45 @@ def test_rejections_are_recorded_not_discarded(seeded):
         (rejected[0]["candidate_id"],))
     assert row["status"] == "rejected" and row["failing_step"] == 1
     assert any(e.get("kind") == "gate_rejection" for e in seeded.health()["events"])
+
+
+# ── supersede-with-valid-time (§4.4) ────────────────────────────────────────
+# Previously the only candidate kind admitted unconditionally, so a periphery
+# false positive became committed history unopposed. See CLAIMS_HARDENING F4.
+
+def _supersede_body(seeded, **over):
+    fid = seeded.fact_id_for({"pred": "flaky_link", "args": ["c", "d"]})
+    body = {"fact_id": fid, "changepoint_index": 20, "valid_to": 1_700_000_000,
+            "support": {"before": 21, "after": 19}, "pvalue": 1e-6,
+            "reason": "one-way level change"}
+    body.update(over)
+    return body
+
+
+def test_a_located_and_significant_regime_change_is_admitted(seeded):
+    d = _decide(seeded, "supersede_valid_time", _supersede_body(seeded))
+    assert d.status == "admitted"
+
+
+def test_supersede_without_a_located_date_is_rejected(seeded):
+    d = _decide(seeded, "supersede_valid_time", _supersede_body(seeded, valid_to=None))
+    assert (d.status, d.failing_step) == ("rejected", 5)
+    assert "WHEN" in d.reason
+
+
+def test_supersede_on_a_thin_regime_is_rejected(seeded):
+    d = _decide(seeded, "supersede_valid_time",
+                _supersede_body(seeded, support={"before": 40, "after": 3}))
+    assert (d.status, d.failing_step) == ("rejected", 5)
+
+
+def test_supersede_that_is_not_significant_is_rejected(seeded):
+    d = _decide(seeded, "supersede_valid_time", _supersede_body(seeded, pvalue=0.4))
+    assert (d.status, d.failing_step) == ("rejected", 6)
+    d = _decide(seeded, "supersede_valid_time", _supersede_body(seeded, pvalue=None))
+    assert (d.status, d.failing_step) == ("rejected", 6)
+
+
+def test_supersede_of_an_unknown_fact_is_rejected(seeded):
+    d = _decide(seeded, "supersede_valid_time", _supersede_body(seeded, fact_id="fact:nope"))
+    assert (d.status, d.failing_step) == ("rejected", 1)

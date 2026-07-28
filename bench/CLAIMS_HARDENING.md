@@ -177,3 +177,81 @@ Measured with a real 2-second gap planted between regimes:
 
 `test_the_located_date_is_what_gets_committed` now passes.
 Regression check: **202 passed, 1 xfailed**, unchanged.
+
+---
+
+## Stage 5 — F4: an exact changepoint test, and a gate that actually gates
+
+**Diagnosis, part 1 (the statistics).** `cusum_changepoint` normalises its alarm
+by `sqrt(p(1-p))`, a Gaussian approximation. Bernoulli increments are badly
+skewed near 0 and 1, so at p=0.95 a single failure moves the statistic by ~4.4
+normalised units against an alarm level of 5 — two failures anywhere in 60
+samples trip it. Measured false-alarm rate of that inner test on a **stationary**
+segment: 40% at p=0.95, 43% at p=0.05, 3% at p=0.5. It was used as the
+*recurrence veto*, so it destroyed 64% of genuine 0.95→0.05 breaks and 48% of
+0.9→0.1 breaks — the failure was worst exactly in the broken-tool regime the
+feature exists for.
+
+**Diagnosis, part 2 (the gate).** `gate.py` admitted `supersede_valid_time`
+unconditionally — the only candidate kind with no evaluation at all. So the
+periphery's ~20% false-positive rate on stationary streams became committed
+structural change, closing the validity window of facts that never changed.
+
+**Fix.** Localization was never the problem (median error 1 in 120), so
+`locate_changepoint` keeps the argmax-of-cumulative-deviation estimator
+verbatim. What changed is the *significance* decision around it:
+
+- `fisher_exact` — two-sided hypergeometric p-value in log space, exact at any
+  base rate. Validated against an exact-integer reference to 1e-9.
+- `changepoint_test` — locate, then test the two segments, Bonferroni-corrected
+  by the number of split positions searched (the argmax is a maximum, so the
+  naive p-value is anti-conservative by exactly that).
+- `is_recurrent` — same exact machinery applied within each segment, so the
+  "did it change again?" question stops depending on the base rate.
+- `gate._evaluate_supersede` — steps 1/5/6: the fact must exist, the proposal
+  must carry a located date, both regimes need ≥8 observations, and the level
+  change must clear `SUPERSEDE_ALPHA` after correction. Tighter than the guard's
+  BH α because a false supersede rewrites history while a false guard is only a
+  rejected candidate.
+
+200 replications per condition, 120 observations each, break planted at 60:
+
+| world | detection before | detection after | |
+|---|---|---|---|
+| step 0.9 → 0.1 | 0.52 | **1.00** | the flagship case |
+| step 0.75 → 0.35 | 0.64 | **0.77** | |
+| step 0.6 → 0.4 | 0.22 | 0.06 | see note |
+| **flat p=0.5** (null) | 0.08 | **0.00** | |
+| **flat p=0.9** (null) | 0.20 | **0.00** | |
+| **oscillating** (null) | 0.21 | **0.05** | |
+| localization, median / p90 | 1 / 1 | **1 / 2** | unchanged |
+
+Strict improvement on every world that matters: the flagship detection doubled
+while both null worlds went to zero.
+
+Two honest notes rather than wins:
+
+- **step 0.6 → 0.4 fell to 0.06.** A 0.2 shift over 120 observations, with the
+  changepoint *searched* rather than known, genuinely is not significant. The
+  old 0.22 was not power, it was noise — its median localization error was 5
+  observations with a p90 of 18, i.e. it was mostly "detecting" the break in the
+  wrong place. Honest low power beats confident mislocation.
+- **gradual drift now reads as a step 0.93 of the time** (was 0.65). A monotone
+  slide has no single date, so this is a mischaracterisation of *shape* — but it
+  is not a false positive: the level really did change and the old regime really
+  has stopped holding. Recorded as accepted behaviour, not as a fixed defect.
+
+New unit coverage: 5 gate fixtures for the supersede step (admit, no date, thin
+regime, insignificant, unknown fact) and 5 statistics tests including a
+base-rate flatness check that pins the exact defect this stage removed.
+
+All 8 `TestRegimeChange` claims pass. Conformance + unit: **216 passed,
+1 xfailed** (up from 202; 14 new unit tests, none removed).
+
+Three of my own new unit tests failed on first run. All three were bad test
+authoring, verified against independent references before changing anything: a
+hand-typed Fisher constant that was simply wrong (0.0027972 vs the true
+0.0027594562), a per-trial localization bound that ignored the tail (median 0,
+p90 2, max 6), and an `is_recurrent` assertion on a series the primary test
+never routes there. Noted because "the test failed so the code is wrong" is the
+trap this whole exercise is meant to avoid.

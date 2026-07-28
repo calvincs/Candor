@@ -88,26 +88,15 @@ def sweep(idx) -> list[tuple[str, dict[str, Any]]]:
                 winner = (key, usable, mdl)
                 break
 
-        changepoint = C.cusum_changepoint(series)
-        # §4.4 routing: a regime change is ONE-WAY. The CUSUM *alarm* can fire
-        # inside the first regime (the global mean straddles), so locate the
-        # change at the argmax of cumulative deviation, then ask whether the
-        # tail beyond it changes AGAIN — if so, the series oscillates, which is
-        # dispersion wearing a changepoint costume, and the repair is a
-        # condition, not a supersede.
-        recurrent = False
-        if changepoint is not None:
-            mean = sum(1 for x in series if x) / len(series)
-            running, peak, located = 0.0, -1.0, 0
-            for i, x in enumerate(series):
-                running += (1.0 if x else 0.0) - mean
-                if abs(running) > peak:
-                    peak, located = abs(running), i
-            changepoint = located
-            # a true step leaves two internally-stable halves; oscillation
-            # leaves at least one half that changes again
-            recurrent = (C.cusum_changepoint(series[:located]) is not None
-                         or C.cusum_changepoint(series[located + 1:]) is not None)
+        # §4.4 routing: a regime change is ONE-WAY. Locate the shift at the
+        # argmax of cumulative deviation, test it exactly against the search
+        # that found it, then ask whether either side changes AGAIN — if so the
+        # series oscillates, which is dispersion wearing a changepoint costume,
+        # and the repair is a condition or a question, never a supersede.
+        detected = C.changepoint_test(series)
+        changepoint = detected[0] if detected else None
+        changepoint_p = detected[1] if detected else None
+        recurrent = C.is_recurrent(series) if detected else False
 
         if winner is not None:
             key, usable, mdl = winner
@@ -147,7 +136,8 @@ def sweep(idx) -> list[tuple[str, dict[str, Any]]]:
                 "changepoint_event_seq": int(rows[changepoint]["event_seq"]),
                 "support": {"before": changepoint + 1,
                             "after": len(series) - changepoint - 1},
-                "reason": "CUSUM regime change, no explaining covariate",
+                "pvalue": changepoint_p,
+                "reason": "one-way level change, no explaining covariate",
             }))
         # under-explained overdispersion without a passing guard: flag + ask
         if winner is None and (changepoint is None or recurrent) and tested:
