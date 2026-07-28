@@ -114,6 +114,13 @@ def _unit_grid(s: int) -> list[float]:
 class _Draws:
     truth: list[int]
     theta: list[float]
+    # Per-world CONTINUOUS mass the credible interval is taken from, in place of
+    # the 0/1 `truth`×`theta` mass whose quantiles collapse to a degenerate coin
+    # for a crisp fact (H3). Per fact type it carries the channel the interval is
+    # meant to convey: the aleatoric rate for a frequency fact (§6.4), and the
+    # continuous epistemic validity for a crisp fact — the sigmoid of the world's
+    # log-odds when it has votes, the sampled epi-Beta quantile otherwise.
+    cont: list[float]
 
 
 def _actor_param_grids(problem: Problem, s: int) -> dict[str, tuple[list[float],
@@ -146,7 +153,7 @@ def _draw(state: FactState, s: int,
           discounts: Optional[dict[str, float]] = None) -> _Draws:
     if state.pinned_negative:
         # A '-' pin is the only hard zero in the system (I5).
-        return _Draws([0] * s, [0.0] * s)
+        return _Draws([0] * s, [0.0] * s, [0.0] * s)
     perm_u = permutation(state.fact_id + "|bernoulli", s)
     unit = _unit_grid(s)
     if state.stmt_type == "crisp" and state.votes and actor_params:
@@ -154,6 +161,7 @@ def _draw(state: FactState, s: int,
         # world's sampled actor parameters, sub-additive within context groups.
         lr_table = response_lr or {}
         truth = []
+        cont = []
         for i in range(s):
             groups: dict[str, float] = {}
             sizes: dict[str, int] = {}
@@ -174,18 +182,28 @@ def _draw(state: FactState, s: int,
             logodds = singles + sum(sub / (sizes[g] ** GAMMA)
                                     for g, sub in groups.items())
             p = 1.0 / (1.0 + math.exp(-max(-60.0, min(60.0, logodds))))
+            cont.append(p)
             truth.append(1 if unit[perm_u[i]] < p else 0)
-        return _Draws(truth, [1.0] * s)
+        return _Draws(truth, [1.0] * s, cont)
     epi_grid = beta_quantile_grid(state.epi[0], state.epi[1], s)
     perm_v = permutation(state.fact_id + "|validity", s)
-    truth = [1 if unit[perm_u[i]] < epi_grid[perm_v[i]] else 0 for i in range(s)]
+    validity = [epi_grid[perm_v[i]] for i in range(s)]
+    truth = [1 if unit[perm_u[i]] < validity[i] else 0 for i in range(s)]
     if state.stmt_type == "frequency":
         alea_grid = beta_quantile_grid(state.alea[0], state.alea[1], s)
         perm_t = permutation(state.fact_id + "|rate", s)
         theta = [alea_grid[perm_t[i]] for i in range(s)]
+        # A frequency prediction's interval conveys the ALEATORIC rate — that is
+        # the channel §6.4 "two-channel recovery" recovers. The admitted fact's
+        # epistemic validity (≈1) is already summarised by the point estimate.
+        cont = theta
     else:
         theta = [1.0] * s
-    return _Draws(truth, theta)
+        # A crisp fact carries no rate, so its interval conveys the EPISTEMIC
+        # validity as a continuous quantity — not the 0/1 threshold, whose
+        # quantiles are a degenerate coin (H3).
+        cont = validity
+    return _Draws(truth, theta, cont)
 
 
 # ── model counting over the proof DNF, under per-literal masses ─────────────
@@ -254,6 +272,7 @@ def run(problem: Problem, budget: int) -> Outcome:
     groups = [g for g in groups if len(g) > 1]
 
     accepted: list[float] = []
+    continuous: list[float] = []
     aleatoric_only: list[float] = []
     rejected = 0
     for i in range(s):
@@ -267,6 +286,10 @@ def run(problem: Problem, budget: int) -> Outcome:
             continue
         mass = {fid: draws[fid].truth[i] * draws[fid].theta[i] for fid in draws}
         accepted.append(_wmc(problem.dnf, mass))
+        # Same world, continuous per-fact mass instead of the 0/1 threshold: the
+        # distribution the credible interval is a quantile of (H3).
+        cont_mass = {fid: draws[fid].cont[i] for fid in draws}
+        continuous.append(_wmc(problem.dnf, cont_mass))
         pure_theta = {fid: draws[fid].theta[i] for fid in draws}
         aleatoric_only.append(_wmc(problem.dnf, pure_theta))
 
@@ -278,11 +301,24 @@ def run(problem: Problem, budget: int) -> Outcome:
                        {}, {}, frozenset(problem.caveats | {"constraint_tension"}),
                        1.0, s, True)
 
-    p = sum(accepted) / n_acc
-    ordered = sorted(accepted)
-    ci = (_quantile(ordered, CI_LO), _quantile(ordered, CI_HI))
+    p_accepted = sum(accepted) / n_acc
+    # The credible interval is a quantile of the CONTINUOUS per-world posterior,
+    # not of the thresholded 0/1 accepted values (which for a crisp fact are a
+    # coin, giving a degenerate interval) (H3).
+    ordered_cont = sorted(continuous)
+    ci = (_quantile(ordered_cont, CI_LO), _quantile(ordered_cont, CI_HI))
+    # Keep the reported point estimate as the accepted-value mean when it already
+    # lies inside its own interval (minimal disruption); otherwise report the
+    # mean of the very distribution the interval is taken from, so p and ci
+    # describe ONE distribution. Clamp last: the point estimate is a summary of
+    # its interval and can never sit outside it.
+    p = p_accepted
+    if not (ci[0] <= p <= ci[1]):
+        p = sum(continuous) / n_acc
+        p = min(ci[1], max(ci[0], p))
+    # Epistemic spread stays a property of the accepted-value distribution.
     mean_sq = sum(x * x for x in accepted) / n_acc
-    epistemic = math.sqrt(max(0.0, mean_sq - p * p))
+    epistemic = math.sqrt(max(0.0, mean_sq - p_accepted * p_accepted))
     has_frequency = any(st.stmt_type == "frequency" for st in problem.facts.values())
     aleatoric = (sum(aleatoric_only) / n_acc) if has_frequency else 0.0
 
