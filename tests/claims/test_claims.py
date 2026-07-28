@@ -216,6 +216,15 @@ class TestRegimeChange:
         score = changepoint_score(streams)
         assert score.rate >= 0.90, f"missed {before}->{after} breaks: {score}"
 
+    def test_finds_a_tool_that_got_fixed(self):
+        """The README's own headline find is a REPAIR (0% -> 79%), not a break.
+        An upward step at a low base rate is the regime the old detector was
+        worst at, so it is tested in its own right."""
+        rng = random.Random(23)
+        streams = [W.step(120, 60, 0.05, 0.79, rng, "repair") for _ in range(n(40))]
+        score = changepoint_score(streams)
+        assert score.rate >= 0.90, f"missed a tool repair: {score}"
+
     def test_locates_the_break_precisely(self):
         rng = random.Random(5)
         streams = [W.step(120, 60, 0.9, 0.1, rng) for _ in range(n(40))]
@@ -306,6 +315,20 @@ class TestConditions:
         assert hits / len(fids) >= floor, (
             f"recovered method in only {hits}/{len(fids)} streams")
 
+    @pytest.mark.parametrize("base", [0.06, 0.94])
+    def test_does_not_manufacture_conditions_at_extreme_base_rates(self, base):
+        """A mostly-failing scraper or a nearly-always-fine health check are
+        both ordinary. Overdispersion statistics that lean on a normal
+        approximation fall apart exactly here — the shipped Tarone form had a
+        41% false-discovery rate at a 5% success rate (F6)."""
+        rng = random.Random(hash(base) & 0xFFFF)
+        streams = [W.covariate(200, rng, base, base) for _ in range(n(30))]
+        m, fids, found = self._guards(streams)
+        bad = sum(any(s == "admitted" for _, s in found.get(f, [])) for f in fids)
+        m.close()
+        assert bad / len(fids) <= 0.10, (
+            f"{bad}/{len(fids)} fabricated conditions at base rate {base}")
+
     def test_does_not_manufacture_conditions_from_noise(self):
         """Five pure-noise covariates per stream and no real effect: any guard
         admitted here is a fishing expedition that survived."""
@@ -351,6 +374,31 @@ class TestHonestConfusion:
         assert told / len(fids) >= 0.80, (
             f"with {label}, only {told}/{len(fids)} unstable streams produced "
             f"any signal at all")
+
+    @pytest.mark.parametrize("p", [0.08, 0.5, 0.92])
+    def test_does_not_pester_about_a_stable_tool(self, p):
+        """The other half of the claim. A substrate that opens a question about
+        every stable stream has not made instability legible, it has made the
+        question list useless."""
+        rng = random.Random(hash(("calm", p)) & 0xFFFF)
+        streams = [W.stationary(240, p, rng) for _ in range(n(25))]
+        m = W.fresh_store("candor-calm-", actors=["tool:probe"])
+        stmts = []
+        for i, s in enumerate(streams):
+            m.assert_({"pred": "steady_ok", "args": [str(p), str(i)],
+                       "stmt_type": "frequency"}, source="ops", actor="human:me")
+            stmts.append({"pred": "steady_ok", "args": [str(p), str(i)]})
+        m.run_gate()
+        fids = [m.fact_id_for(s) for s in stmts]
+        for stmt, s in zip(stmts, streams):
+            W.feed(m, stmt, s, ctx_fn=lambda i: {})
+        m.run_gate()
+        asked = {q["target_id"] for q in m.questions()}
+        noise = sum(f in asked for f in fids)
+        m.close()
+        assert noise / len(fids) <= 0.10, (
+            f"opened questions about {noise}/{len(fids)} perfectly stable "
+            f"streams at p={p}")
 
     def test_a_question_names_a_measurement_to_take(self):
         rng = random.Random(43)

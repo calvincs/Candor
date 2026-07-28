@@ -255,3 +255,82 @@ hand-typed Fisher constant that was simply wrong (0.0027972 vs the true
 p90 2, max 6), and an `is_recurrent` assertion on a series the primary test
 never routes there. Noted because "the test failed so the code is wrong" is the
 trap this whole exercise is meant to avoid.
+
+---
+
+## Stage 6 — F5: say something when nothing explains the variance
+## and F6: Tarone's Z had the wrong denominator
+
+**F5 diagnosis.** The flag/question branch was gated on `and tested` — at least
+one *recorded covariate* had to be independently overdispersed. A stream
+swinging between 85% and 35% with no useful context logged therefore produced
+nothing: no flag, no question, no signal of any kind. The time axis had already
+detected the instability (CUSUM alarmed 492/500 and correctly ruled it recurrent
+480/500) and the routing threw that away. The `suggested_measurement([])` branch
+— "log wider: the missing argument was never captured" — was unreachable code.
+
+**F5 fix.** `temporal_dispersion`: overdispersion across contiguous time blocks
+at several scales, corrected for the scales tried. It needs no covariate,
+because the variance is visible in the series itself. The routing now speaks on
+either ground — a covariate that clusters the variance without clearing the
+guard bar, *or* dispersion over time — and the residual partition for the second
+case is the time blocks themselves.
+
+Identical instability (p=0.85/0.35, blocks of 20, 240 observations, 60 streams),
+varying only what the agent happened to log:
+
+| what was logged | flagged before | flagged after | the agent is told |
+|---|---|---|---|
+| nothing at all | **0 / 60** | **60 / 60** | "log wider: the disagreeing observations share no recorded covariate" |
+| pure-noise context | 1 / 60 | 58 / 60 | "variance clusters beyond the recorded keys (noise)" |
+| a partial proxy (`batch`) | 57 / 60 | 59 / 60 | names the proxy |
+| the true driver | 60 / 60 | 60 / 60 | guard proposed; question marked *explained*, not open |
+
+**F6, found while fixing F5.** The first version of `temporal_dispersion` used
+`tarone_z` and false-alarmed on 27% of stationary p=0.1 streams while never
+firing at p=0.9 — the same base-rate disease Stage 5 had just removed from the
+changepoint path. Tracked to the statistic itself:
+
+    shipped:   denom = sqrt( 2 Σ n_i(n_i-1) · p/(1-p) )
+    corrected: denom = sqrt( 2 Σ n_i(n_i-1) )
+
+The `p/(1-p)` factor does not belong to Tarone's Z. Its cost, measured on
+covariate splits with **no real effect**, 6 keys tested per stream, BH at 0.05:
+
+| true base rate | false-discovery rate, as shipped | corrected |
+|---|---|---|
+| 0.05 | **0.407** | 0.043 |
+| 0.10 | 0.263 | 0.052 |
+| 0.30 | 0.165 | 0.068 |
+| 0.60 | 0.013 | 0.043 |
+| 0.90 | 0.000 | 0.035 |
+
+A scraper that succeeds 5% of the time — an ordinary broken tool — was being
+handed a fabricated "works when X" condition **41% of the time**. Corrected, the
+rate is flat at 3.5–6.8% against a nominal 5% at every base rate, and the
+statistic is *more* powerful on real structure (0.995 vs 0.980 detection on the
+oscillation world), so nothing was traded away.
+
+Guard-path effect of the correction, 120 streams × 200 observations:
+
+| | before | after |
+|---|---|---|
+| recall, strong effect | 120/120 | 120/120 |
+| recall, moderate effect | 114/120 | 115/120 |
+| false guards, null world at p=0.6 | 1/120 | 7/120 |
+| false guards, null world at p=0.05 | ~41% (est. from the statistic) | ≤10% (tested) |
+
+The p=0.6 rise from 0.8% to 5.8% is the test becoming *calibrated* — BH controls
+the false-discovery rate at 5%, and the old 0.8% there was over-conservatism
+bought with catastrophic anti-conservatism everywhere else.
+
+**New claims tests for boundaries an agent actually meets** (6 added):
+a tool that got *fixed* rather than broken (0.05 → 0.79 — the README's own
+headline find is a repair, and an upward step at a low base rate was the
+detector's worst regime); fabricated conditions at extreme base rates (0.06 and
+0.94); and the other half of the honest-confusion claim — that a *stable* tool
+at p ∈ {0.08, 0.5, 0.92} does not get pestered with questions, because a
+question list that fires on everything is worthless.
+
+**Claims suite: 34 passed, 0 failed.** Conformance + unit: **216 passed, 1
+xfailed**. Structural audits (`make audit`) both clean.

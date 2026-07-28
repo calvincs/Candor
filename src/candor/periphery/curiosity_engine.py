@@ -139,15 +139,30 @@ def sweep(idx) -> list[tuple[str, dict[str, Any]]]:
                 "pvalue": changepoint_p,
                 "reason": "one-way level change, no explaining covariate",
             }))
-        # under-explained overdispersion without a passing guard: flag + ask
-        if winner is None and (changepoint is None or recurrent) and tested:
+        # Under-explained instability: nothing was guarded and no single date
+        # accounts for it. Two independent grounds to speak, either sufficient —
+        # a recorded covariate that clusters the variance without clearing the
+        # guard bar, or dispersion on the time axis itself, which needs no
+        # covariate at all. Requiring the former was the whole defect: an agent
+        # that logged nothing relevant was told nothing (F5).
+        if winner is None and (changepoint is None or recurrent):
             z_any = max((C.tarone_z(list(u.values())) or 0.0)
-                        for _, u, _, _ in tested)
-            if z_any > C.TARONE_Z_THRESHOLD:
+                        for _, u, _, _ in tested) if tested else 0.0
+            by_covariate = z_any > C.TARONE_Z_THRESHOLD
+            over_time = C.temporal_dispersion(series)
+            if by_covariate or over_time is not None:
                 idx.execute("UPDATE facts SET dispersion_flag=1 WHERE id=?",
                             (fact["id"],))
-                _open_question(idx, fact["id"], tested[0][1], None,
-                               ruled_out=[t[0] for t in tested])
+                if by_covariate:
+                    residual, ruled_out = tested[0][1], [t[0] for t in tested]
+                else:
+                    # The residual partition IS the time blocks: "it is unstable
+                    # across these stretches and nothing you logged says why."
+                    residual = {f"t{i}": g
+                                for i, g in enumerate(over_time[2])}
+                    ruled_out = [t[0] for t in tested]
+                _open_question(idx, fact["id"], residual, None,
+                               ruled_out=ruled_out)
 
         # §4.6 breadth over confirming observations
         confirming = {k: [ctx[k] for ctx, out in obs if out and k in ctx]
