@@ -23,6 +23,55 @@ from . import curiosity as C
 MIN_OBS = 16
 
 
+def _avalanche(x: int) -> int:
+    """SplitMix64 finalizer: a deterministic, replay-stable 64-bit hash whose
+    output bits are decorrelated from the input's low-order structure."""
+    mask = (1 << 64) - 1
+    x &= mask
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & mask
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & mask
+    return x ^ (x >> 31)
+
+
+#: One in every DISCOVERY_STRIDE observations (in hash-shuffled order) is routed
+#: to the held-out VALIDATION set; the rest drive DISCOVERY. Not one-half: a
+#: 50/50 split halves the effective sample on each side, which (i) drops a weak
+#: but real covariate (0.70 vs 0.40 success) below the detection bar and (ii)
+#: pushes a two-value partition below the gate's 8-per-side support floor on
+#: short streams. A 3:1 split keeps discovery powerful and every partition clear
+#: of the floor while leaving a validation quarter large enough to reject a
+#: mis-selected direction.
+DISCOVERY_STRIDE = 4
+
+
+def discovery_mask(seqs: "list[int]") -> list[bool]:
+    """A deterministic discovery/validation split aligned with `seqs`: True marks
+    a discovery observation, False a held-out validation one.
+
+    The split is *systematic* over a hash-shuffled order — sort the observations
+    by a hash of their immutable event_seq, then hand every DISCOVERY_STRIDE-th
+    one to validation. That buys three properties a plain positional even/odd
+    split lacks:
+
+    * Decorrelation. A covariate recorded as ``value[i % 2]`` — an alternating
+      method, a flip-flopping route — aliases exactly with index parity, so an
+      'even-indexed' discovery set would see only one covariate value and no
+      contrast at all. Sorting by a hash of the event_seq breaks that aliasing.
+    * Balance. Systematic sampling of the shuffled order splits every covariate
+      value into discovery/validation with far lower allocation variance than
+      independent per-observation hashing, which matters when a covariate is
+      recorded on only a few dozen observations (the direction stays estimable).
+    * Replay-stability. Keyed on the immutable event_seq, the split is
+      bit-for-bit reproducible on replay.
+    """
+    order = sorted(range(len(seqs)), key=lambda i: (_avalanche(seqs[i]), seqs[i]))
+    mask = [True] * len(seqs)
+    for rank, i in enumerate(order):
+        if rank % DISCOVERY_STRIDE == DISCOVERY_STRIDE - 1:
+            mask[i] = False
+    return mask
+
+
 def _mdl_fields(groups: dict[str, C.Group]) -> dict[str, float]:
     pooled = [C.Group(sum(g.n for g in groups.values()),
                       sum(g.k for g in groups.values()))]
@@ -60,13 +109,24 @@ def sweep(idx) -> list[tuple[str, dict[str, Any]]]:
                for r in rows]
         keys = sorted({k for ctx, _ in obs for k in ctx})
 
+        # §3.4 step 5: a GENUINE discovery/validation split. Every discovery
+        # statistic below (Tarone / BH / MDL / direction) is computed on the
+        # discovery observations only; the hits/misses handed to the gate come
+        # from the disjoint, untouched validation quarter. Otherwise the gate's
+        # held-out check (gate.py rejects on hits <= misses) runs on data that
+        # already drove the selection, which is no check at all (M8).
+        seqs = [int(r["event_seq"]) for r in rows]
+        disc = discovery_mask(seqs)
+        disc_obs = [o for o, d in zip(obs, disc) if d]
+        val_obs = [o for o, d in zip(obs, disc) if not d]
+
         # covariate search: Tarone per key, BH across the keys tested (§4.5).
         # A key whose cardinality exceeds n/(2*min_support) cannot yield a
         # guard — an m-ary split at that granularity is a lookup table, not a
         # condition — but it still licenses DETECTION (flag + open question).
         tested: list[tuple[str, dict[str, C.Group], float, bool]] = []
         for key in keys:
-            groups = C.partition_by_key(obs, key)
+            groups = C.partition_by_key(disc_obs, key)
             usable = {v: g for v, g in groups.items()
                       if g.n >= C.MIN_SUPPORT_PER_PARTITION}
             if len(usable) < 2:
@@ -76,7 +136,7 @@ def sweep(idx) -> list[tuple[str, dict[str, Any]]]:
                 continue
             pvalue = 0.5 * math.erfc(z / math.sqrt(2)) if z > 0 else 1.0
             guardable = len(groups) <= max(
-                2, len(obs) // (2 * C.MIN_SUPPORT_PER_PARTITION))
+                2, len(disc_obs) // (2 * C.MIN_SUPPORT_PER_PARTITION))
             tested.append((key, usable, pvalue, guardable))
         keep = C.benjamini_hochberg([t[2] for t in tested]) if tested else []
         winner = None
@@ -101,11 +161,12 @@ def sweep(idx) -> list[tuple[str, dict[str, Any]]]:
         if winner is not None:
             key, usable, mdl = winner
             best = max(usable, key=lambda v: usable[v].k / max(1, usable[v].n))
-            # §3.4 step 5: validate on held-out observations, not the discovery
-            # set — even-indexed obs discover, odd-indexed validate direction.
+            # The guard and its direction were chosen on the discovery
+            # observations; the hits/misses the gate weighs are scored on the
+            # disjoint validation set, which no discovery statistic touched (M8).
             hits = misses = 0
-            for i, (ctx, out) in enumerate(obs):
-                if i % 2 == 0 or key not in ctx:
+            for ctx, out in val_obs:
+                if key not in ctx:
                     continue
                 predicted = ctx[key] == best
                 if predicted == out:
