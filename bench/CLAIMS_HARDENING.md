@@ -77,3 +77,36 @@ loosened before being counted:
 | `test_discounting_a_source_moves_crisp_beliefs` | F2 |
 
 Existing suites unchanged: 22 conformance + 1 xfail, 180 unit.
+
+---
+
+## Stage 2 — F1: retraction is keyed on the source, not on a payload hash
+
+**Diagnosis.** `redact()` takes a *content-addressed payload hash*, and an
+observation payload is `{stmt, outcome, ctx, grade, confidence}` — no actor in
+it. Two sources reporting the same outcome on the same statement in the same
+context therefore share one payload. Purging a liar's hashes destroyed **185 of
+600 honest observations**. That is not a corner case: agreement between sources
+is the situation the whole substrate exists to reason about, so the documented
+recovery path is most destructive exactly when it is most needed.
+
+**Fix.** A new `retraction` event kind, keyed on the actor. Exclusion happens at
+fold time in `_refold`: a retracted actor's event *skeletons* stay in the chain
+forever (nothing is erased, I3 holds) but contribute no payload, so every
+downstream number recomputes without them — including trust, because
+`_apply_resolution` re-runs `score_against_settlement` on replay. Append-only
+and reversible via `restore=True`; last write per actor wins.
+
+`redact()` keeps its content-purging meaning (that is a real and separate need —
+sensitive payloads) and is now honest about its scope: `redaction_scope(hash)`
+reports the blast radius, and redacting a shared payload records a
+`redaction_shared_payload` diagnostic.
+
+| | before | after |
+|---|---|---|
+| honest observations destroyed by purging one source | 185 / 600 | **0** |
+| predictions matching a store the source never touched | 0 / 12 | **12 / 12** |
+
+`test_retracting_a_source_leaves_other_actors_untouched` and
+`test_retraction_reproduces_a_store_the_source_never_touched` now pass.
+Regression check: **202 passed, 1 xfailed** (conformance + unit), unchanged.

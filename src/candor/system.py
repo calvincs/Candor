@@ -111,8 +111,14 @@ class CandorSystem:
     def _refold(self) -> None:
         """Fold the whole log into a fresh index. Redaction implies exclusion."""
         redacted = self._redacted_payloads()
+        retracted = self._retracted_actors()
         for ev in self.ledger.read_all():
-            payload = (None if ev.payload_hash in redacted
+            # A retracted source keeps its event skeletons forever (nothing is
+            # erased) but contributes no payload, so every downstream number
+            # recomputes as if it never spoke. Retraction events themselves are
+            # always applied, or retracting an operator would be irreversible.
+            silenced = ev.actor in retracted and ev.kind != "retraction"
+            payload = (None if silenced or ev.payload_hash in redacted
                        else self.ledger.payload(ev.payload_hash))
             apply_mod.apply_event(self.index, ev, payload)
         self._apply_reliability_overrides()
@@ -130,6 +136,22 @@ class CandorSystem:
             payload = self.ledger.payload(ev.payload_hash)
             if payload:
                 out.add(payload["payload_hash"])
+        return out
+
+    def _retracted_actors(self) -> set[str]:
+        """Actors currently silenced. Folded in sequence order, so a later
+        restore reverses an earlier retraction without editing anything."""
+        out: set[str] = set()
+        for ev in self.ledger.read_all():
+            if ev.kind != "retraction":
+                continue
+            payload = self.ledger.payload(ev.payload_hash)
+            if not payload:
+                continue
+            if payload.get("restore"):
+                out.discard(payload["actor"])
+            else:
+                out.add(payload["actor"])
         return out
 
     def replay(self) -> str:
@@ -308,7 +330,52 @@ class CandorSystem:
             kind = "fact"
         return {"target_kind": kind, "target_id": target_id, "reason": reason}
 
+    def retract_source(self, actor: str, reason: str, restore: bool = False,
+                       authority: str = "human:operator") -> int:
+        """Silence one source. Every number it ever moved recomputes without it.
+
+        This — not `redact` — is how you recover from a bad source. Redaction
+        is keyed on a *content-addressed payload*, which by construction has no
+        actor in it: two sources reporting the same outcome on the same
+        statement in the same context share one payload, so redacting a liar's
+        hash also destroys the honest reports that agreed with it. Retraction
+        is keyed on the actor, so its blast radius is exactly one source.
+
+        Append-only and reversible: `restore=True` un-silences, and the whole
+        history stays in the chain either way.
+        """
+        payload = {"actor": actor, "reason": reason, "restore": bool(restore)}
+        ev = self.ledger.append("retraction", authority, payload)
+        self.index.reset()
+        self._refold()
+        self.closure()
+        return ev.seq
+
+    def redaction_scope(self, payload_hash: str) -> dict[str, Any]:
+        """Who would lose data if this payload were redacted (§3.13 blast radius).
+
+        Payloads are content-addressed and deduplicated, so a hash can be
+        shared by any number of actors. Call this before `redact` when the
+        intent is to purge a *source* rather than a piece of content — or use
+        `retract_source`, which cannot over-reach.
+        """
+        rows = self.index.query(
+            "SELECT actor, kind FROM events WHERE payload_hash=?", (payload_hash,))
+        actors = sorted({r["actor"] for r in rows})
+        return {"payload_hash": payload_hash, "events": len(rows),
+                "actors": actors, "shared": len(actors) > 1}
+
     def redact(self, payload_hash: str) -> int:
+        """Purge one payload's CONTENT everywhere it appears.
+
+        Scoped to content, not to a source: every event carrying this hash
+        loses its payload, whoever wrote it. See `redaction_scope` for the
+        blast radius, and `retract_source` to silence a single actor instead.
+        """
+        scope = self.redaction_scope(payload_hash)
+        if scope["shared"]:
+            apply_mod.diagnostic(self.index, 0, "redaction_shared_payload", scope)
+            self._health_events.append({"kind": "redaction_shared_payload", **scope})
         payload = {"payload_hash": payload_hash}
         ev = self.ledger.append("redaction", "human:operator", payload)
         apply_mod.apply_event(self.index, ev, payload)
