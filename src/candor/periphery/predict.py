@@ -101,6 +101,97 @@ def permutation(tag: str, n: int) -> list[int]:
 
 _UNIT_GRID_CACHE: dict[int, list[float]] = {}
 
+# Mantissa bounds of a normal IEEE-754 double: any float in a binade equals
+# m·ulp with m ∈ [2**52, 2**53).
+_M_LO = 1 << 52
+_M_HI = 1 << 53
+
+
+def _batch_binade(s: float, d: float, cap: int) -> Optional[tuple[int, float]]:
+    """Add `+d` to `s` up to `cap` times while the increment stays exactly `d`.
+
+    Within one binade every float is a multiple of ulp(s) and the per-step
+    increment `d = fl(s+x)-s` is constant, so `s + t·d` stays exactly
+    representable — the batch is bit-identical to `t` separate rounded adds.
+    Returns (steps, s_after), or None to defer to one explicit step (binade
+    edge, subnormal, or a non-clean increment).
+    """
+    _, exp = math.frexp(s)
+    u = math.ldexp(1.0, exp - 53)              # ulp(s)
+    if u == 0.0:                               # subnormal region: don't risk it
+        return None
+    fm = abs(s) / u
+    fmd = abs(d) / u
+    if fm != int(fm) or fmd != int(fmd):       # not clean multiples of ulp(s)
+        return None
+    m, md = int(fm), int(fmd)
+    if md < 1 or not (_M_LO <= m < _M_HI):
+        return None
+    if (s > 0.0) == (d > 0.0):                 # |s| growing toward the top edge
+        room = (_M_HI - 1 - m) // md
+        t = room if room < cap else cap
+        new_m = m + t * md
+    else:                                      # |s| shrinking toward the low edge
+        room = (m - _M_LO) // md
+        t = room if room < cap else cap
+        new_m = m - t * md
+    if t < 1 or not (_M_LO <= new_m < _M_HI):
+        return None
+    return t, math.copysign(math.ldexp(float(new_m), exp - 53), s)
+
+
+def _fold_add(acc: float, x: float, count: int) -> float:
+    """Exact value of ``for _ in range(count): acc = acc + x`` in O(log count).
+
+    A crisp fact accumulates one log-LR contribution per observation; identical
+    observations contribute the identical value in a given world (H8), so a run
+    of `count` of them can be collapsed. Multiplying `x` by `count` is NOT
+    bit-identical to the fold — IEEE rounds each add, not once — so we reproduce
+    the fold exactly, batching whole binades where the increment is constant.
+    """
+    if count <= 0:
+        return acc
+    if x == 0.0:
+        return acc + 0.0                       # normalises -0.0, then idempotent
+    remaining = count
+    s = acc
+    while remaining > 0:
+        s1 = s + x
+        d = s1 - s
+        if d == 0.0:                           # x absorbed: no add can move s
+            return s
+        if remaining == 1:
+            return s1
+        if (s1 + x) - s1 != d:                 # increment not yet constant
+            s = s1
+            remaining -= 1
+            continue
+        batched = _batch_binade(s, d, remaining)
+        if batched is None:
+            s = s1
+            remaining -= 1
+            continue
+        t, s = batched
+        remaining -= t
+    return s
+
+
+def _vote_runs(votes: tuple[tuple[str, int, int, Optional[str]], ...]
+               ) -> list[list]:
+    """Maximal contiguous runs of an identical (actor, vote, grade, sig) key as
+    ``[actor, vote, grade, sig, count]``. Order-preserving: folding a run's one
+    contribution `count` times reproduces the per-vote fold bit-for-bit."""
+    runs: list[list] = []
+    for actor, vote, grade, sig in votes:
+        if runs:
+            last = runs[-1]
+            if (last[0] == actor and last[1] == vote
+                    and last[2] == grade and last[3] == sig):
+                last[4] += 1
+                continue
+        runs.append([actor, vote, grade, sig, 1])
+    return runs
+
 
 def _unit_grid(s: int) -> list[float]:
     grid = _UNIT_GRID_CACHE.get(s)
@@ -159,14 +250,19 @@ def _draw(state: FactState, s: int,
     if state.stmt_type == "crisp" and state.votes and actor_params:
         # v0.3 Δ1/Δ2: validity via two-coin log-LR composition under the
         # world's sampled actor parameters, sub-additive within context groups.
+        # H8: identical votes contribute the identical log-LR in a given world,
+        # so we collapse maximal runs ONCE and fold each run's contribution by
+        # its count — the per-world loop is O(distinct runs), not O(votes), and
+        # bit-identical to the per-vote fold (see `_fold_add`).
         lr_table = response_lr or {}
+        runs = _vote_runs(state.votes)
         truth = []
         cont = []
         for i in range(s):
             groups: dict[str, float] = {}
             sizes: dict[str, int] = {}
             singles = 0.0
-            for actor, vote, grade, sig in state.votes:
+            for actor, vote, grade, sig, count in runs:
                 if grade > 0 and (actor, vote, grade) in lr_table:
                     contribution = lr_table[(actor, vote, grade)]   # Δ6 mean LR
                 else:
@@ -175,10 +271,11 @@ def _draw(state: FactState, s: int,
                 if discounts:
                     contribution = temper(contribution, discounts.get(actor, 1.0))
                 if sig is None:
-                    singles += contribution
+                    singles = _fold_add(singles, contribution, count)
                 else:
-                    groups[sig] = groups.get(sig, 0.0) + contribution
-                    sizes[sig] = sizes.get(sig, 0) + 1
+                    groups[sig] = _fold_add(groups.get(sig, 0.0), contribution,
+                                            count)
+                    sizes[sig] = sizes.get(sig, 0) + count
             logodds = singles + sum(sub / (sizes[g] ** GAMMA)
                                     for g, sub in groups.items())
             p = 1.0 / (1.0 + math.exp(-max(-60.0, min(60.0, logodds))))
