@@ -23,6 +23,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+try:
+    import fcntl  # POSIX advisory file locks; auto-released on process exit.
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None  # type: ignore[assignment]
+
 from .hashing import GENESIS, canon_json, hash_obj, sha256_hex
 
 SEGMENT_LINES = 4096
@@ -99,12 +104,47 @@ class Ledger:
         self._fh = None
         self._fh_path: Optional[Path] = None
         self._lines_in_seg = 0
+        self._lock_fh = None
+
+    # ── writer lock (§7 single writer) ────────────────────────────────────────
+    def _acquire_lock(self) -> None:
+        """Take an exclusive advisory lock so a second live writer on this root
+        can't silently fork the chain (M1). flock auto-releases on process exit,
+        so a crash leaves no stale lock. On non-POSIX we degrade to no lock."""
+        if fcntl is None or self._lock_fh is not None:
+            return
+        lock_path = self.root / ".writer.lock"
+        lock_fh = lock_path.open("w")
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lock_fh.close()
+            raise LedgerError(
+                f"ledger root {self.root} is already locked by a live writer; "
+                f"refusing to open a second writer that would fork the chain")
+        self._lock_fh = lock_fh
+
+    def _release_lock(self) -> None:
+        if self._lock_fh is None:
+            return
+        try:
+            if fcntl is not None:
+                fcntl.flock(self._lock_fh.fileno(), fcntl.LOCK_UN)
+        except OSError:  # pragma: no cover - best effort; close() still frees it
+            pass
+        self._lock_fh.close()
+        self._lock_fh = None
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     def open(self) -> None:
         self.seg_dir.mkdir(parents=True, exist_ok=True)
         self.cas_dir.mkdir(parents=True, exist_ok=True)
-        self._recover()
+        self._acquire_lock()
+        try:
+            self._recover()
+        except Exception:
+            self._release_lock()
+            raise
 
     def close(self) -> None:
         if self._fh is not None:
@@ -112,6 +152,7 @@ class Ledger:
             self._fh.close()
             self._fh = None
             self._fh_path = None
+        self._release_lock()
 
     def destroy(self) -> None:
         """Wipe the store completely (test-only reset path)."""
@@ -305,7 +346,11 @@ class Ledger:
 
     # ── test-only fault injection support (§6.1) ─────────────────────────────
     def append_raw_line(self, text: str) -> None:
-        """Write an unverifiable line to the tail segment (torn-write simulation)."""
+        """Write an unverifiable line to the tail segment (torn-write simulation).
+
+        A torn write is what a *crashed* writer leaves behind, and a crash frees
+        the process's flock. Model that here by releasing the writer lock too, so
+        a fresh recovery writer can open the same root (M1)."""
         fh = self._open_tail()
         fh.write(text.encode("utf-8"))
         fh.flush()
@@ -313,3 +358,4 @@ class Ledger:
         self._fh.close()
         self._fh = None
         self._fh_path = None
+        self._release_lock()
