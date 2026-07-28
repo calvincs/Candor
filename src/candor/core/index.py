@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS events(
   seq INTEGER PRIMARY KEY, ts INTEGER NOT NULL,
   kind TEXT NOT NULL CHECK(kind IN
     ('assertion','observation','supersede','admission','demotion','pin','claim',
-     'resolution','alias','redaction','retraction','checkpoint')),
+     'resolution','alias','redaction','retraction','checkpoint','reliability')),
   actor TEXT NOT NULL, payload_hash TEXT NOT NULL, source_ref TEXT,
   context_sig TEXT, prev_hash TEXT NOT NULL, hash TEXT NOT NULL);
 
@@ -42,6 +42,15 @@ CREATE TABLE IF NOT EXISTS actors(
   obs_quota_per_epoch INTEGER NOT NULL, cand_quota_per_epoch INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS actor_reliability(
   actor TEXT NOT NULL, frame TEXT NOT NULL CHECK(frame IN ('internal','external')),
+  rel_a REAL NOT NULL, rel_b REAL NOT NULL, PRIMARY KEY(actor, frame));
+-- Operator trust overrides, folded from `reliability` ledger events. Kept
+-- SEPARATE from the learned actor_reliability Beta: an override tempers the
+-- crisp-vote path (read via _actor_discounts), but learned settlement
+-- reliability already speaks through the two-coin LR and must not be counted
+-- twice. This is what the old <root>/reliability_overrides.json side file was —
+-- now a materialized view of the chain, so a ledger-only rebuild reproduces it.
+CREATE TABLE IF NOT EXISTS reliability_overrides(
+  actor TEXT NOT NULL, frame TEXT NOT NULL,
   rel_a REAL NOT NULL, rel_b REAL NOT NULL, PRIMARY KEY(actor, frame));
 -- v0.3 Δ1: the two-coin confusion table. Four INTEGER cells per (actor, frame),
 -- moved only by the trusted settlement path; every real number (sens, fpr,

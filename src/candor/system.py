@@ -26,7 +26,6 @@ from .core.canonical import context_signature, fact_key
 from .core.committed import counts as counts_mod
 from .core.committed import facts as facts_mod
 from .core.committed import reliability as reliability_mod
-from .core.hashing import canon_json, sha256_hex
 from .core.index import Index
 from .core.ledger import Ledger, is_payload_hash
 from .periphery import conjecture as conjecture_mod
@@ -97,9 +96,6 @@ class CandorSystem:
         self.index.reset()
         self._closure = None
         self._health_events = []
-        override = self.root / "reliability_overrides.json"
-        if override.exists():
-            override.unlink()
         self.ledger.open()
 
     def close(self) -> None:
@@ -127,7 +123,8 @@ class CandorSystem:
             payload = (None if silenced or ev.payload_hash in redacted
                        else self.ledger.payload(ev.payload_hash))
             apply_mod.apply_event(self.index, ev, payload)
-        self._apply_reliability_overrides()
+        # Reliability overrides fold in naturally now (they are `reliability`
+        # events), in true ledger order — no post-fold re-application (I3).
         # Replay determinism: flags/questions/breadth are a deterministic
         # function of the folded observations, so re-derive them here.
         curiosity_mod.sweep(self.index)
@@ -632,7 +629,6 @@ class CandorSystem:
                 payload = (None if ev.payload_hash in redacted
                            else self.ledger.payload(ev.payload_hash))
                 apply_mod.apply_event(tmp_index, ev, payload)
-            self._apply_reliability_overrides(tmp_index)
             clo = apply_mod.rebuild_closure(tmp_index)
             tmp_index.commit()
             calib = calibration_mod.IsotonicMap.from_json(snap.get("calib_map"))
@@ -710,7 +706,7 @@ class CandorSystem:
         if any(v >= 2 for v in sources.values()) and len(needed) >= 2:
             caveats.add("shared_provenance")
         return predict_mod.Problem(fid, dnf, states, groups, caveats, confusion,
-                                   response_lr, self._actor_discounts())
+                                   response_lr, self._actor_discounts(idx))
 
     def _fact_state(self, idx: Index, fact_id: str) -> predict_mod.FactState:
         row = idx.one("SELECT stmt_type, dispersion_flag, breadth_class FROM facts "
@@ -757,46 +753,52 @@ class CandorSystem:
     def fact_id_for(self, stmt: Mapping[str, Any]) -> Optional[str]:
         return facts_mod.lookup(self.index, stmt["pred"], list(stmt["args"]))
 
-    def _actor_discounts(self) -> dict[str, float]:
+    def _actor_discounts(self, idx: Optional[Index] = None) -> dict[str, float]:
         """Operator-set trust discounts for the crisp vote path.
 
-        Only *explicit* overrides count. Learned reliability lives in the
-        confusion ledger and already speaks through the two-coin LR; folding
-        E[rel] in as well would double-count the same settlements. An untouched
-        store returns {} and composes byte-identically to before this existed.
+        Only *explicit* overrides count — read from the `reliability_overrides`
+        table, which is folded from `reliability` ledger events (never from
+        settlements). Learned reliability lives in the confusion ledger and
+        already speaks through the two-coin LR; folding E[rel] in as well would
+        double-count the same settlements. An untouched store returns {} and
+        composes byte-identically to before this existed.
+
+        Reads from `idx` so a snapshot replay (predict_at) tempers with the
+        overrides as of its own ledger position, not the live store's.
         """
-        path = self.root / "reliability_overrides.json"
-        if not path.exists():
-            return {}
+        target = idx if idx is not None else self.index
         out: dict[str, float] = {}
-        for key, (a, b) in json.loads(path.read_text()).items():
-            actor, frame = key.split("|", 1)
-            if frame == reliability_mod.FACT_FRAME and (a + b) > 0:
-                out[actor] = float(a) / (float(a) + float(b))
+        for row in target.query(
+                "SELECT actor, frame, rel_a, rel_b FROM reliability_overrides"):
+            a, b = float(row["rel_a"]), float(row["rel_b"])
+            if row["frame"] == reliability_mod.FACT_FRAME and (a + b) > 0:
+                out[row["actor"]] = a / (a + b)
         return out
 
-    def set_reliability(self, actor: str, frame: str, a: float, b: float) -> None:
+    def set_reliability(self, actor: str, frame: str, a: float, b: float,
+                        authority: str = "human:operator") -> None:
         """Operator override on a source's trust. Moves BOTH channels.
 
         On frequency facts it discounts the aleatoric trial contribution; on
         crisp facts it tempers the source's vote evidence (v0.3 Δ1 replaced the
         epi Beta with two-coin votes, and before this the lever silently missed
         them — see bench/CLAIMS_HARDENING.md F2).
-        """
-        reliability_mod.set_reliability(self.index, actor, frame, a, b)
-        path = self.root / "reliability_overrides.json"
-        current = json.loads(path.read_text()) if path.exists() else {}
-        current[f"{actor}|{frame}"] = [a, b]
-        path.write_text(canon_json(current), encoding="utf-8")
 
-    def _apply_reliability_overrides(self, idx: Optional[Index] = None) -> None:
-        path = self.root / "reliability_overrides.json"
-        if not path.exists():
-            return
-        target = idx if idx is not None else self.index
-        for key, (a, b) in json.loads(path.read_text()).items():
-            actor, frame = key.split("|", 1)
-            reliability_mod.set_reliability(target, actor, frame, a, b)
+        A first-class ledger event, not a side file: it folds in sequence order
+        like everything else, so a ledger-only rebuild reproduces it (I1) and it
+        composes with settlements at its true position (I3).
+        """
+        # Validate before appending (C3): actor_reliability's frame CHECK would
+        # otherwise reject the event only after it is already in the chain,
+        # bricking every future replay.
+        if frame not in ("internal", "external"):
+            raise ValueError(
+                f"reliability frame must be 'internal' or 'external', got {frame!r}")
+        payload = {"actor": actor, "frame": frame,
+                   "rel_a": float(a), "rel_b": float(b)}
+        ev = self.ledger.append("reliability", authority, payload)
+        apply_mod.apply_event(self.index, ev, payload)
+        self.index.commit()
 
     def why(self, obj_id: str) -> dict[str, Any]:
         row = self.index.one("SELECT * FROM facts WHERE id=?", (obj_id,))

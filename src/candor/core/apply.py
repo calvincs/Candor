@@ -297,6 +297,26 @@ def _apply_checkpoint(idx: "Index", ev: "Event", payload: dict[str, Any]) -> Non
                 "VALUES(?,?,?)", (ev.ts, "checkpoint", canon_json(payload)))
 
 
+def _apply_reliability(idx: "Index", ev: "Event", payload: dict[str, Any]) -> None:
+    """Operator trust override, folded in ledger order (I1/I3).
+
+    Writes the actor_reliability Beta — consumed by the alea (frequency) discount
+    via `reliability.expected` — and records the override in a dedicated table so
+    the crisp-vote path (`_actor_discounts`) tempers on operator levers ONLY.
+    Learned settlement reliability moves actor_reliability too, but it already
+    speaks through the two-coin LR; counting it on the crisp path as well would
+    double-count the same settlements, so it must never enter this table.
+    """
+    actor = payload["actor"]
+    frame = payload["frame"]
+    a, b = float(payload["rel_a"]), float(payload["rel_b"])
+    reliability_mod.set_reliability(idx, actor, frame, a, b)
+    idx.execute(
+        "INSERT INTO reliability_overrides(actor, frame, rel_a, rel_b) "
+        "VALUES(?,?,?,?) ON CONFLICT(actor, frame) DO UPDATE SET "
+        "rel_a=excluded.rel_a, rel_b=excluded.rel_b", (actor, frame, a, b))
+
+
 _HANDLERS = {
     "assertion": _apply_assertion,
     "admission": _apply_admission,
@@ -310,6 +330,7 @@ _HANDLERS = {
     "redaction": _apply_redaction,
     "retraction": _apply_retraction,
     "checkpoint": _apply_checkpoint,
+    "reliability": _apply_reliability,
 }
 
 
@@ -438,6 +459,8 @@ _HASH_QUERIES: tuple[tuple[str, str], ...] = (
     ("redactions", "SELECT payload_hash FROM redactions ORDER BY payload_hash"),
     ("actor_reliability", "SELECT actor, frame, rel_a, rel_b FROM actor_reliability "
                           "ORDER BY actor, frame"),
+    ("reliability_overrides", "SELECT actor, frame, rel_a, rel_b "
+                              "FROM reliability_overrides ORDER BY actor, frame"),
     ("actor_confusion", "SELECT actor, frame, tp, fn, fp, tn FROM actor_confusion "
                         "ORDER BY actor, frame"),
     ("actor_response", "SELECT actor, frame, vote, grade, n_true, n_false "

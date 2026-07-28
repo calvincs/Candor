@@ -39,13 +39,15 @@ def is_payload_hash(value: Any) -> bool:
 # Kinds admitted to the chain (spec §2 `events.kind` CHECK constraint).
 EVENT_KINDS = frozenset({
     "assertion", "observation", "supersede", "admission", "demotion",
-    "pin", "claim", "resolution", "alias", "redaction", "retraction", "checkpoint",
+    "pin", "claim", "resolution", "alias", "redaction", "retraction",
+    "checkpoint", "reliability",
 })
 
 # §3.1 durability: structural events fsync immediately, observations may batch.
+# A reliability override is an operator lever on committed numbers — durable.
 DURABLE_KINDS = frozenset({
     "admission", "resolution", "pin", "supersede", "alias", "redaction",
-    "retraction", "checkpoint",
+    "retraction", "checkpoint", "reliability",
 })
 
 
