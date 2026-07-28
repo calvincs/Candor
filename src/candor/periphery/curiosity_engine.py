@@ -134,7 +134,12 @@ def sweep(idx) -> list[tuple[str, dict[str, Any]]]:
             z = C.tarone_z(list(usable.values()))
             if z is None:
                 continue
-            pvalue = 0.5 * math.erfc(z / math.sqrt(2)) if z > 0 else 1.0
+            # M9: a far-tail-calibrated p-value, not the anti-conservative normal
+            # approximation, so the BH threshold this feeds holds its nominal
+            # false-guard rate out where alpha/m bites.
+            pvalue = C.tarone_pvalue(list(usable.values()))
+            if pvalue is None:
+                continue
             guardable = len(groups) <= max(
                 2, len(disc_obs) // (2 * C.MIN_SUPPORT_PER_PARTITION))
             tested.append((key, usable, pvalue, guardable))
