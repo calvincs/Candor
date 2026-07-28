@@ -151,3 +151,29 @@ A first draft of this stage broke the §6.2 lexical firewall (`grep -rn weight`
 outside `core/committed/`) in three doc comments. Caught by `tests/unit/
 test_audit.py`, reworded, re-verified. Recording it because that invariant
 exists precisely to catch careless naming, and it did.
+
+---
+
+## Stage 4 — F3: commit the located date, not the sweep's wall clock
+
+**Diagnosis.** The sweep locates a changepoint to a median of 1 observation in
+120 — the localization was never the problem. `apply.py` writes
+`valid_to = body.get("valid_to", ev.ts)`, and the curiosity body carried only
+`changepoint_index`. Every located regime change was therefore stamped with the
+moment the sweep happened to run.
+
+**Fix.** The sweep now joins `events.ts` and carries `valid_to` (the timestamp
+of the observation at the located changepoint — the last moment the old regime
+held), plus `changepoint_event_seq` and per-side `support` for audit. Replay-safe:
+the timestamp comes from the ledger, so the sweep stays a deterministic function
+of the log.
+
+Measured with a real 2-second gap planted between regimes:
+
+| | before | after |
+|---|---|---|
+| `valid_to` vs the true boundary | 2018 ms off | **0 ms** (the last observation of the old regime) |
+| `valid_to` vs the sweep's clock | 3 ms off | 4022 ms off |
+
+`test_the_located_date_is_what_gets_committed` now passes.
+Regression check: **202 passed, 1 xfailed**, unchanged.

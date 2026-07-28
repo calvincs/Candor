@@ -43,8 +43,9 @@ def sweep(idx) -> list[tuple[str, dict[str, Any]]]:
         "ORDER BY f.id")
     for fact in facts:
         rows = idx.query(
-            "SELECT event_seq, outcome FROM observations WHERE fact_id=? "
-            "ORDER BY event_seq", (fact["id"],))
+            "SELECT o.event_seq, o.outcome, e.ts FROM observations o "
+            "JOIN events e ON e.seq = o.event_seq WHERE o.fact_id=? "
+            "ORDER BY o.event_seq", (fact["id"],))
         if len(rows) < MIN_OBS:
             continue
         series = [bool(r["outcome"]) for r in rows]
@@ -136,8 +137,16 @@ def sweep(idx) -> list[tuple[str, dict[str, Any]]]:
                         (fact["id"],))
             _open_question(idx, fact["id"], usable, key)
         elif changepoint is not None and not recurrent:
+            # The whole point of locating a changepoint is to record WHEN the
+            # old regime stopped holding. Carry the located observation's own
+            # timestamp, or the commit stamps the sweep's wall clock instead
+            # and the located date is thrown away (F3).
             proposals.append(("supersede_valid_time", {
                 "fact_id": fact["id"], "changepoint_index": changepoint,
+                "valid_to": int(rows[changepoint]["ts"]),
+                "changepoint_event_seq": int(rows[changepoint]["event_seq"]),
+                "support": {"before": changepoint + 1,
+                            "after": len(series) - changepoint - 1},
                 "reason": "CUSUM regime change, no explaining covariate",
             }))
         # under-explained overdispersion without a passing guard: flag + ask
