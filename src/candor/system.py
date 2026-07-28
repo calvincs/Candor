@@ -110,6 +110,12 @@ class CandorSystem:
     # ── replay (§6.1 hook, I1) ───────────────────────────────────────────────
     def _refold(self) -> None:
         """Fold the whole log into a fresh index. Redaction implies exclusion."""
+        # Start from an empty index unconditionally (C1): the count writers are
+        # increments, so folding onto a non-empty index re-adds every prior
+        # count. open() used to skip this and double-count on every reopen;
+        # replay/retract_source/redact already reset and now just reset twice
+        # (harmless), matching this method's "fresh index" contract.
+        self.index.reset()
         redacted = self._redacted_payloads()
         retracted = self._retracted_actors()
         for ev in self.ledger.read_all():
