@@ -16,12 +16,21 @@ March scraper was bad, you have two scalpels, both reversible:
 
 ```python
 m.set_reliability("tool:bad-scraper", "external", 0.001, 100)  # discount it...
-m.redact(payload_hash)                                         # ...or purge the payload
+m.retract_source("tool:bad-scraper", reason="hallucinated in March")  # ...or silence it
 h = m.replay()   # every downstream number recomputes as if it never spoke
 ```
 
 Nothing else in the store is touched, because no number was ever stored — only
-integer counts keyed by who reported them. See `examples/quickstart.py`.
+integer counts keyed by who reported them. The retracted source's events stay in
+the chain forever; they simply stop contributing, and `restore=True` puts them
+back. See `examples/quickstart.py`.
+
+**Reach for `retract_source`, not `redact`, when the problem is a source.**
+`redact` purges a *payload*, and payloads are content-addressed with no actor in
+them — so two sources reporting the same outcome on the same statement share
+one. Redacting a liar's hashes also destroys the honest reports that agreed with
+it. `redaction_scope(hash)` tells you the blast radius before you fire; `redact`
+is the right tool only when the *content* itself must go (secrets, PII).
 
 ## 2. Source-reliability tracking: trust that is earned, asymmetric, and cheap
 

@@ -334,3 +334,65 @@ question list that fires on everything is worthless.
 
 **Claims suite: 34 passed, 0 failed.** Conformance + unit: **216 passed, 1
 xfailed**. Structural audits (`make audit`) both clean.
+
+---
+
+## Stage 7 — docs match the code
+
+The goal was that the codebase meets the claims it makes, which cuts both ways:
+where the docs taught a path that does not work, the docs were wrong too.
+
+- `docs/use-cases.md` recommended `redact(payload_hash)` to purge a bad source.
+  It now teaches `retract_source` and explains why `redact` is the wrong tool
+  for that job (and the right one for secrets and PII).
+- `docs/api.md` gains `retract_source` and `redaction_scope`, with `redact`
+  re-described as content-scoped rather than source-scoped.
+- `docs/architecture.md` §curiosity now describes the exact changepoint test and
+  the gate that evaluates its output, and records that instability is detected
+  on the time axis without needing a covariate.
+- `DEVIATIONS.md` D21-D24 record the four substantive departures from the spec
+  as shipped, each citing its measurement.
+- `README.md` points at `make claims` and states the count honestly.
+
+Examples re-run: `quickstart`, `source_reliability`, and `regime_change` all
+still produce their intended output, including the three-way
+guard / regime-change / open-question routing.
+
+---
+
+## Final state
+
+| suite | result |
+|---|---|
+| `tests/conformance.py` | 22 passed, 1 xfailed |
+| `tests/unit/` | 194 passed (was 180; +14) |
+| `tests/claims/` | **34 passed, 0 failed** (was 17 passed, 11 failed) |
+| `make audit` | both structural invariants clean |
+
+Six defects found, six fixed, none traded against another. Everything that held
+up in the Stage 0 audit still holds: trust asymmetry, the Brier margin over
+vote-averaging, calibration (ECE 0.0148, slope 0.998), guard recall, changepoint
+localization, replay determinism, snapshot reproduction and order-invariance are
+all still measured green by the same tests that measured them before.
+
+### Where the substrate is now stronger than its README
+
+- Regime detection on the flagship case went 0.52 → **1.00** while false
+  positives on stationary streams went 0.20 → **0.00**.
+- The covariate search is calibrated at every base rate, not just near p=0.5 —
+  false discoveries on a mostly-failing tool dropped from 41% to ~5%.
+- Instability with *nothing logged* went from silence to a question 60/60,
+  which is the case the "log wide" advice was always aimed at.
+
+### Known and accepted
+
+- A gradual monotone drift is reported as a located step ~93% of the time. There
+  is no single date to find, so this mischaracterises the *shape* — but the level
+  really did change and the old regime really has stopped holding. Left as
+  documented behaviour rather than papered over.
+- Weak steps (0.6 → 0.4 over 120 observations) are detected ~6% of the time.
+  With the changepoint searched rather than known, that shift genuinely is not
+  significant; the previous 0.22 was noise, not power (median localization error
+  5 observations, p90 18).
+- Subtle short-period oscillation (0.80/0.40, period 10) is caught ~45% of the
+  time. Large swings and outages are caught ~99-100%.
