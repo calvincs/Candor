@@ -26,6 +26,7 @@ from .core.canonical import context_signature, fact_key
 from .core.committed import counts as counts_mod
 from .core.committed import facts as facts_mod
 from .core.committed import reliability as reliability_mod
+from .core.hashing import GENESIS
 from .core.index import Index
 from .core.ledger import Ledger, is_payload_hash
 from .periphery import conjecture as conjecture_mod
@@ -94,6 +95,7 @@ class CandorSystem:
     def reset(self) -> None:
         self.ledger.destroy()
         self.index.reset()
+        self._clear_checkpoints()
         self._closure = None
         self._health_events = []
         self.ledger.open()
@@ -104,8 +106,20 @@ class CandorSystem:
         self.retrieval_log.close()
 
     # ── replay (§6.1 hook, I1) ───────────────────────────────────────────────
-    def _refold(self) -> None:
-        """Fold the whole log into a fresh index. Redaction implies exclusion."""
+    def _refold(self, use_checkpoint: bool = True) -> None:
+        """Fold the log into a fresh index. Redaction implies exclusion.
+
+        Fast path (a DROPPABLE optimization, never a primary artifact — I1): when
+        a VALID checkpoint exists, restore the derived index to the pre-sweep
+        folded snapshot it froze and fold only the tail after it, instead of
+        re-folding from genesis. The snapshot is taken BEFORE the curiosity sweep
+        (which sets some flags monotonically), so restore + tail-fold + one sweep
+        over the complete observation set is byte-identical to a full replay. A
+        checkpoint at seq S is only used if no retraction/redaction exists at
+        seq > S (those retroactively rewrite events at seq <= S that the snapshot
+        already froze) and if its file passes an integrity probe; otherwise we
+        fall back to a full fold. See `_select_checkpoint`.
+        """
         # Start from an empty index unconditionally (C1): the count writers are
         # increments, so folding onto a non-empty index re-adds every prior
         # count. open() used to skip this and double-count on every reopen;
@@ -114,7 +128,16 @@ class CandorSystem:
         self.index.reset()
         redacted = self._redacted_payloads()
         retracted = self._retracted_actors()
+        start_seq = 0
+        if use_checkpoint:
+            cp = self._select_checkpoint()
+            if cp is not None and self.index.restore_from(cp[2]):
+                start_seq = cp[0]
+        self._last_checkpoint_seq = start_seq
+        folded = 0
         for ev in self.ledger.read_all():
+            if ev.seq <= start_seq:
+                continue           # already frozen in the restored checkpoint
             # A retracted source keeps its event skeletons forever (nothing is
             # erased) but contributes no payload, so every downstream number
             # recomputes as if it never spoke. Retraction events themselves are
@@ -123,6 +146,8 @@ class CandorSystem:
             payload = (None if silenced or ev.payload_hash in redacted
                        else self.ledger.payload(ev.payload_hash))
             apply_mod.apply_event(self.index, ev, payload)
+            folded += 1
+        self._last_tail_folded = folded
         # Reliability overrides fold in naturally now (they are `reliability`
         # events), in true ledger order — no post-fold re-application (I3).
         # Replay determinism: flags/questions/breadth are a deterministic
@@ -130,6 +155,97 @@ class CandorSystem:
         curiosity_mod.sweep(self.index)
         self.index.commit()
         self._closure = None
+
+    # ── checkpoints (droppable derived-state cache, spec §6.4 / SPEC:336) ────
+    def _checkpoint_dir(self) -> Path:
+        return self.root / "checkpoints"
+
+    def _clear_checkpoints(self) -> None:
+        d = self._checkpoint_dir()
+        if d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+
+    def _select_checkpoint(self) -> Optional[tuple[int, str, Path]]:
+        """Newest VALID checkpoint for the CURRENT chain, or None.
+
+        A checkpoint file is named by the ledger head hash it summarizes. It is a
+        candidate only if that head hash actually appears in THIS chain — then its
+        prefix is cryptographically exactly events 1..S (the chain is hash-linked),
+        so a stale file from a rewound/divergent history simply never matches. It
+        is VALID only if no retraction/redaction event exists at seq > S: those
+        kinds retroactively silence/remove events at seq <= S, which the snapshot
+        froze, so a later one makes it stale (the CRUX — restore, i.e. a retraction
+        with restore=True, counts too). Among valid candidates pick the largest S
+        to fold the shortest tail. The chosen file's integrity is verified at
+        restore time; a torn snapshot falls back to a full replay.
+        """
+        ckpt_dir = self._checkpoint_dir()
+        if not ckpt_dir.exists():
+            return None
+        files: dict[str, Path] = {}
+        for p in ckpt_dir.glob("*.sqlite3"):
+            head = p.stem
+            if is_payload_hash(head):   # 64-char lowercase hex — a head-hash shape
+                files[head] = p
+        if not files:
+            return None
+        head_seq: dict[str, int] = {}
+        last_retro = 0
+        for ev in self.ledger.read_all():
+            if ev.kind in ("retraction", "redaction"):
+                last_retro = ev.seq     # read_all yields in seq order → ends at max
+            if ev.hash in files:
+                head_seq[ev.hash] = ev.seq
+        best: Optional[tuple[int, str, Path]] = None
+        for head, seq in head_seq.items():
+            if seq < last_retro:
+                continue                # a later retraction/redaction invalidated it
+            if best is None or seq > best[0]:
+                best = (seq, head, files[head])
+        return best
+
+    def checkpoint(self) -> Optional[str]:
+        """Snapshot the derived index at the current ledger head as a droppable
+        cache, so future open()s fold only the tail (spec §6.4, SPEC.md:336).
+
+        Costs NO ledger event — the snapshot is keyed by the current head hash and
+        written under <root>/checkpoints/, leaving ledger_head/seq untouched (so no
+        head/seq assertion elsewhere can break). Deleting it changes nothing: a
+        full replay from the log alone still reproduces identical state (I1).
+
+        The snapshot is the PRE-SWEEP folded state (the sweep is re-run after the
+        tail folds on restore). Building it reuses an earlier valid checkpoint when
+        present, so making a fresh checkpoint folds only the tail too. Returns the
+        head hash checkpointed, or None if the ledger is empty.
+        """
+        head = self.ledger.head()
+        if head == GENESIS:
+            return None
+        dest = self._checkpoint_dir() / f"{head}.sqlite3"
+        if dest.exists():
+            return head
+        redacted = self._redacted_payloads()
+        retracted = self._retracted_actors()
+        tmp_dir = Path(tempfile.mkdtemp(prefix="candor-ckpt-"))
+        try:
+            tmp_index = Index(tmp_dir / "index.sqlite3")
+            tmp_index.open()
+            start_seq = 0
+            cp = self._select_checkpoint()
+            if cp is not None and tmp_index.restore_from(cp[2]):
+                start_seq = cp[0]
+            for ev in self.ledger.read_all():
+                if ev.seq <= start_seq:
+                    continue
+                silenced = ev.actor in retracted and ev.kind != "retraction"
+                payload = (None if silenced or ev.payload_hash in redacted
+                           else self.ledger.payload(ev.payload_hash))
+                apply_mod.apply_event(tmp_index, ev, payload)
+            tmp_index.snapshot_to(dest)
+            tmp_index.close()
+            return head
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def _redacted_payloads(self) -> set[str]:
         out: set[str] = set()
@@ -158,10 +274,12 @@ class CandorSystem:
         return out
 
     def replay(self) -> str:
+        # A forced full-from-genesis fold: replay() is the I1 oracle, so it must
+        # ignore the checkpoint cache and re-derive from the log alone.
         self.ledger.close()
         self.ledger.open()
         self.index.reset()
-        self._refold()
+        self._refold(use_checkpoint=False)
         return self.closure_hash()
 
     # ── closure ──────────────────────────────────────────────────────────────
@@ -941,6 +1059,10 @@ class CandorSystem:
         }
 
     _last_rejection_rate: float = 0.0
+    # Fold instrumentation (checkpoint fast path): how many tail events the last
+    # _refold folded, and the checkpoint seq it restored from (0 = full replay).
+    _last_tail_folded: int = 0
+    _last_checkpoint_seq: int = 0
 
     # ── test-only fault injection (§6.1) ─────────────────────────────────────
     def corrupt(self, what: str, arg: str = "") -> None:

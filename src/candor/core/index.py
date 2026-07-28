@@ -10,6 +10,8 @@ isotonic maps are all read-time compositions.
 
 from __future__ import annotations
 
+import os
+import shutil
 import sqlite3
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -237,6 +239,75 @@ class Index:
     def reset(self) -> None:
         self.drop()
         self.open()
+
+    # ── droppable snapshot cache (checkpoint support, I1) ─────────────────────
+    def snapshot_to(self, dest: Path) -> None:
+        """Write a CONSISTENT, standalone copy of this index to `dest`.
+
+        Consistency: commit, fold the WAL back into the main file, then use the
+        SQLite online-backup API for a transactionally coherent page copy — never
+        a raw `cp` of a live, WAL-mode file (which would tear).
+
+        Atomicity: materialize into a temp file and `os.replace` it into place, so
+        a crash mid-write can only leave an orphan `*.tmp`; a reader sees either
+        the previous snapshot or the whole new one, never a fragment (§3.1 spirit).
+        """
+        assert self.db is not None, "index not open"
+        self.db.commit()
+        self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = Path(str(dest) + ".tmp")
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            p = Path(str(tmp) + suffix)
+            if p.exists():
+                p.unlink()
+        bck = sqlite3.connect(str(tmp))
+        try:
+            with bck:
+                self.db.backup(bck)
+        finally:
+            bck.close()
+        # A clean rollback-journal backup leaves no sidecars, but delete any just
+        # in case so only the single main file is promoted.
+        for suffix in ("-wal", "-shm", "-journal"):
+            p = Path(str(tmp) + suffix)
+            if p.exists():
+                p.unlink()
+        os.replace(str(tmp), str(dest))
+
+    def restore_from(self, src_path: Path) -> bool:
+        """Replace this index's contents with the snapshot at `src_path`.
+
+        Returns True only if the snapshot was intact and applied. A torn, partial
+        or corrupt snapshot is DETECTED (via SQLite's own integrity probe) and
+        left untrusted — this index is not mutated, so the caller falls back to a
+        full replay. The snapshot is a droppable cache; refusing it never loses
+        anything (I1).
+        """
+        src_path = Path(src_path)
+        if not src_path.exists():
+            return False
+        try:
+            probe = sqlite3.connect(f"file:{src_path}?mode=ro", uri=True)
+            try:
+                row = probe.execute("PRAGMA quick_check").fetchone()
+            finally:
+                probe.close()
+        except Exception:
+            return False
+        if not row or row[0] != "ok":
+            return False
+        # Intact: swap this index's file for the snapshot, then reopen. Only
+        # mutate AFTER the integrity gate, so a rejected snapshot is a no-op.
+        self.close()
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            p = Path(str(self.path) + suffix)
+            if p.exists():
+                p.unlink()
+        shutil.copyfile(str(src_path), str(self.path))
+        self.open()
+        return True
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
