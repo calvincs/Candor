@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import shutil
 import tempfile
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
@@ -37,6 +38,11 @@ from .periphery import predict as predict_mod
 from .periphery.retrieval import RetrievalLog, Retriever
 
 REFUSED = "Refused"
+
+# In-memory operational log surfaced by health(). It is NOT replay state (it
+# never touches the ledger), so a long-lived process must not let it grow
+# without bound (M11b); the newest entries are the ones worth keeping.
+_HEALTH_EVENTS_CAP = 1000
 
 
 class QuotaExceeded(RuntimeError):
@@ -82,7 +88,12 @@ class CandorSystem:
             dense=embedder_mod.from_env(self.root))   # v0.3 Δ5: optional, injected
         self._closure: Optional[closure_mod.Closure] = None
         self._calib = calibration_mod.IsotonicMap()
-        self._health_events: list[dict[str, Any]] = []
+        self._health_events: deque[dict[str, Any]] = deque(maxlen=_HEALTH_EVENTS_CAP)
+        # M11c: max observation event_seq the last run_gate sweep processed. The
+        # sweep is a pure function of the observed facts, so with this unchanged
+        # it would re-propose byte-identical candidates — an idle run_gate can
+        # skip it. None until the first sweep actually runs.
+        self._sweep_obs_watermark: Optional[int] = None
         self.open()
 
     # ── lifecycle ────────────────────────────────────────────────────────────
@@ -97,7 +108,8 @@ class CandorSystem:
         self.index.reset()
         self._clear_checkpoints()
         self._closure = None
-        self._health_events = []
+        self._health_events = deque(maxlen=_HEALTH_EVENTS_CAP)
+        self._sweep_obs_watermark = None
         self.ledger.open()
 
     def close(self) -> None:
@@ -323,13 +335,28 @@ class CandorSystem:
         return last
 
     def run_gate(self) -> list[dict[str, Any]]:
-        """Curiosity sweep (§3.10), then drain candidates through the gate."""
-        for kind, body in curiosity_mod.sweep(self.index):
-            ev = self.ledger.append("assertion", "agent:curiosity",
-                                    {"candidate_kind": kind, "body": body},
-                                    source_ref="curiosity:sweep")
-            apply_mod.apply_event(self.index, ev,
-                                  {"candidate_kind": kind, "body": body})
+        """Curiosity sweep (§3.10), then drain candidates through the gate.
+
+        The sweep is a deterministic function of the observed facts (its inputs
+        are observations attributed to admitted facts, and an observation only
+        attaches to a fact once that fact is admitted — so any new sweep input
+        arrives as a new observation event). With the max observation event_seq
+        unchanged since the last sweep, the sweep would re-propose byte-identical
+        candidates and re-write identical flags: pure churn (M11c). A genuinely
+        idle run_gate therefore skips the sweep — appending nothing and paying
+        O(1) instead of an O(observations) sweep plus a standing assertion event
+        per proposal on every call. The candidate drain still runs, so pending
+        candidates from `assert_` are always processed.
+        """
+        obs_seq = self._max_observation_seq()
+        if obs_seq != self._sweep_obs_watermark:
+            for kind, body in curiosity_mod.sweep(self.index):
+                ev = self.ledger.append("assertion", "agent:curiosity",
+                                        {"candidate_kind": kind, "body": body},
+                                        source_ref="curiosity:sweep")
+                apply_mod.apply_event(self.index, ev,
+                                      {"candidate_kind": kind, "body": body})
+            self._sweep_obs_watermark = obs_seq
         runs: list[dict[str, Any]] = []
         pending = self.index.query(
             "SELECT id, kind, body_json, proposer FROM candidates "
@@ -357,6 +384,13 @@ class CandorSystem:
         self._closure = None
         self.index.commit()
         return runs
+
+    def _max_observation_seq(self) -> int:
+        """Largest observation event_seq in the index (0 if none). The sweep's
+        watermark: it advances only when a new observation is applied, never on
+        run_gate's own admission/assertion appends."""
+        row = self.index.one("SELECT MAX(event_seq) AS m FROM observations")
+        return int(row["m"]) if row and row["m"] is not None else 0
 
     def set_actor_quota(self, actor: str, obs_per_epoch: Optional[int] = None,
                         cand_per_epoch: Optional[int] = None) -> None:
@@ -736,8 +770,8 @@ class CandorSystem:
         if head == self.ledger.head():
             return self.predict(stmt, budget=10_000)
         tmp_dir = Path(tempfile.mkdtemp(prefix="candor-snapshot-"))
+        tmp_index = Index(tmp_dir / "index.sqlite3")
         try:
-            tmp_index = Index(tmp_dir / "index.sqlite3")
             tmp_index.open()
             events = list(self.ledger.read_all())
             # A genesis head predates every event, so its snapshot folds NOTHING
@@ -776,10 +810,13 @@ class CandorSystem:
             if calib.hash != snap["calib_map_hash"]:
                 calib = self._calib if self._calib.hash == snap["calib_map_hash"] \
                     else calibration_mod.IsotonicMap()
-            out = self._predict_with(tmp_index, clo, stmt, 10_000, calib, head)
-            tmp_index.close()
-            return out
+            return self._predict_with(tmp_index, clo, stmt, 10_000, calib, head)
         finally:
+            # Close on EVERY path (M11a): the success path used to be the only
+            # place tmp_index.close() ran, so any exception in the fold/predict
+            # leaked its 3 sqlite fds (db/-wal/-shm). Closing here also lets the
+            # rmtree succeed where an open handle would block unlink.
+            tmp_index.close()
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def _predict_with(self, idx: Index, clo: closure_mod.Closure,
@@ -1053,7 +1090,7 @@ class CandorSystem:
             "quota_usage": [{"actor": r["actor"], "kind": r["kind"],
                              "used": int(r["used"])} for r in quota_rows],
             "constraint_rejection_rate": self._last_rejection_rate,
-            "events": self._health_events + diagnostics,
+            "events": list(self._health_events) + diagnostics,
             "ledger_head": self.ledger.head(),
             "retrieval_log_size": self.retrieval_log.count(),
         }
