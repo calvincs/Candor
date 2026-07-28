@@ -295,6 +295,11 @@ class CandorSystem:
         return out
 
     def pin(self, target_id: str, polarity: str, reason: str, authority: str) -> int:
+        # Validate at the boundary, before the ledger append (C3): the index's
+        # pins.polarity CHECK would otherwise reject the event only after it was
+        # already in the chain, bricking every future replay.
+        if polarity not in ("+", "-"):
+            raise ValueError(f"pin polarity must be '+' or '-', got {polarity!r}")
         payload = {"target_kind": "fact", "target_id": target_id,
                    "polarity": polarity, "reason": reason, "authority": authority}
         ev = self.ledger.append("pin", authority, payload)
@@ -395,6 +400,12 @@ class CandorSystem:
     # ── claims & settlement (§3.8) ───────────────────────────────────────────
     def claim(self, stmt: Mapping[str, Any], frame: str, criterion: str,
               due: int) -> str:
+        # Validate at the boundary, before the ledger append (C3): the index's
+        # claims.frame CHECK would otherwise reject the event only after it was
+        # already in the chain, bricking every future replay.
+        if frame not in ("internal", "external"):
+            raise ValueError(
+                f"claim frame must be 'internal' or 'external', got {frame!r}")
         settlement, verifier_id = self._triage(stmt, criterion)
         if settlement == "unsettleable":
             return REFUSED
