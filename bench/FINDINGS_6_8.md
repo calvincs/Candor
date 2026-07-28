@@ -178,6 +178,14 @@ margins never move to fit results.
 
 # Real-world round: Pernix history through the curiosity engine (2026-07-27)
 
+> **Publication note (2026-07-28).** One verbatim error-message fragment quoted
+> from a private memory in F11 was paraphrased for public release; it named an
+> internal virtualenv. Same convention as the pre-registrations: the edit is
+> called out rather than applied silently, it changes no recorded number, date
+> or verdict, and the original stands in the private research branch. All other
+> corpus material referenced here is aggregate (counts, splits, dates) — no
+> memory text is reproduced.
+
 1,136 outcome events (fetch/tool/search, 337 targets, 2026-03→07) extracted
 from the live box's memories and replayed in historical order
 (`bench/run_realworld.py`, report in `data/bench/realworld_report.json`).
@@ -185,9 +193,9 @@ from the live box's memories and replayed in historical order
 ## F11 — the engine found two real, corroborated regime changes
 
 * **tool_ok(yt-dlp): 0% → 79% success, located 2026-04-30.** The memories
-  independently document the cause: yt-dlp broken by a stale-venv shebang
-  ("FileNotFoundError ... cai_v2 no longer existed") and then the recorded
-  fix. The engine recovered the repair date from outcome data alone.
+  independently document the cause — a stale virtualenv shebang pointing at an
+  interpreter path that no longer existed — and then the recorded fix. The
+  engine recovered the repair date from outcome data alone.
 * **search_ok(*): 93% → 38%, located 2026-04-22.** Matches the corpus's
   documented collapse of `search_web` reliability and the late-April pivot to
   crawl4ai/direct-browse fallbacks.
