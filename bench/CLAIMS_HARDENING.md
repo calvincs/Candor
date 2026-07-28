@@ -396,3 +396,34 @@ all still measured green by the same tests that measured them before.
   5 observations, p90 18).
 - Subtle short-period oscillation (0.80/0.40, period 10) is caught ~45% of the
   time. Large swings and outages are caught ~99-100%.
+
+---
+
+## Stage 8 — make the suite itself trustworthy
+
+A claims suite that flakes is worse than none, so two problems in my own harness
+were fixed before calling the work done.
+
+**Non-reproducible seeding.** Five worlds were seeded with `random.Random(hash(("flat", p)))`.
+`hash()` on anything containing a string is salted per process, so those worlds
+differed on every run and the suite could not be reproduced from its own source.
+Replaced with `seed_for(...)` over `zlib.crc32`, which is stable across
+processes. Verified by running the suite three times under randomised
+`PYTHONHASHSEED`: identical results.
+
+**A bar tighter than its own sample size.** `test_does_not_pester_about_a_stable_tool`
+allowed ≤10% questions on stationary streams over 25 replications. The sweep's
+false-alarm rate on stationary data is ~5% *by construction* (that is the nominal
+α), measured over 3000 trials at 0.0453 / 0.0433 / 0.0530 for p = 0.08 / 0.5 /
+0.92 — flat, as intended. Against a true 5% rate, 25 draws exceed a 10% bar
+about 13% of the time, so the test was flaky on its own noise rather than on any
+defect. Widened to 40 replications and a 15% bar (a ~0.5% flake rate), which
+still catches any regression above ~15% — the broken statistic this suite was
+built to find sat at 38%.
+
+Also marked the three prediction-heavy classes `slow`, so `make claims-fast`
+(46s) is genuinely a different thing from `make claims` (2m36s).
+
+**Scale check.** `CLAIMS_SCALE=3 make claims`: **34 passed** in 9m16s. Thresholds
+that survive tripling the replication count are measuring effects, not sampling
+luck.
