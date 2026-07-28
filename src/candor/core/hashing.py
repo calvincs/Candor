@@ -10,8 +10,14 @@ GENESIS = "0" * 64
 
 
 def canon_json(obj: Any) -> str:
-    """Deterministic JSON: sorted keys, no insignificant whitespace."""
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    """Deterministic JSON: sorted keys, no insignificant whitespace.
+
+    allow_nan=False: NaN/Infinity are not portable JSON and poison float math,
+    so a non-finite value raises ValueError here rather than being written
+    verbatim into a payload (M5).
+    """
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, allow_nan=False)
 
 
 def sha256_hex(data: bytes | str) -> str:

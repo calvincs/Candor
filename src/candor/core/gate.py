@@ -12,6 +12,7 @@ reproduces the same committed tier without re-running any judgement.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -124,6 +125,15 @@ def _evaluate_fact(idx: "Index", cid: str, body: dict[str, Any]) -> Decision:
         cargs = canonicalize_args(args, reg["canonical_units"])
     except CanonicalizationError as exc:
         return _reject(cid, "fact", 2, str(exc))
+
+    # M5: a non-finite float (NaN/Infinity) has no canonical numeric normal form
+    # and cannot be serialized into a portable payload. Reject it here so it can
+    # never reach the committed tier (and never raises later inside fact_key).
+    for a in cargs:
+        if isinstance(a, float) and not math.isfinite(a):
+            return _reject(cid, "fact", 2,
+                           "argument is a non-finite float (NaN/Infinity) with "
+                           "no canonical numeric normal form")
 
     stmt_type = body.get("stmt_type", "crisp")
     if stmt_type not in ("crisp", "frequency"):
