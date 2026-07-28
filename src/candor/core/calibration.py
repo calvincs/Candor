@@ -74,9 +74,21 @@ def fit_isotonic(pairs: Sequence[tuple[float, int]]) -> IsotonicMap:
     if not pairs:
         return IsotonicMap()
     ordered = sorted(pairs, key=lambda t: t[0])
-    blocks: list[list[float]] = []  # [sum_y, count, sum_x]
+    # Pool tied x into ONE block BEFORE PAVA: `sorted` is stable, so equal-x
+    # points otherwise keep their input order and PAVA merges them differently
+    # depending on it — and predict() emits multiples of 1/512, so tied x is the
+    # norm. Pooling first makes the fit a function of the input multiset, not the
+    # order settled claims happened to be enumerated in (M7).
+    pooled: list[list[float]] = []  # [sum_y, count, x] — one entry per distinct x
     for x, y in ordered:
-        blocks.append([float(y), 1.0, float(x)])
+        if pooled and pooled[-1][2] == float(x):
+            pooled[-1][0] += float(y)
+            pooled[-1][1] += 1.0
+        else:
+            pooled.append([float(y), 1.0, float(x)])
+    blocks: list[list[float]] = []  # [sum_y, count, sum_x]
+    for sum_y, count, x in pooled:
+        blocks.append([sum_y, count, x * count])
         while len(blocks) >= 2 and blocks[-2][0] / blocks[-2][1] > blocks[-1][0] / blocks[-1][1]:
             b = blocks.pop()
             a = blocks.pop()
