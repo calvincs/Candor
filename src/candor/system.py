@@ -615,20 +615,36 @@ class CandorSystem:
             tmp_index = Index(tmp_dir / "index.sqlite3")
             tmp_index.open()
             events = list(self.ledger.read_all())
-            cutoff = None
-            for ev in events:
-                if ev.hash == head:
-                    cutoff = ev.seq
-                    break
-            if cutoff is None and head != "0" * 64:
-                raise KeyError("snapshot ledger head is not in this chain")
+            # A genesis head predates every event, so its snapshot folds NOTHING
+            # (cutoff=0, and every event seq is ≥1). The old code left cutoff=None
+            # for genesis and then folded the ENTIRE log — the opposite of empty.
+            if head == "0" * 64:
+                cutoff = 0
+            else:
+                cutoff = None
+                for ev in events:
+                    if ev.hash == head:
+                        cutoff = ev.seq
+                        break
+                if cutoff is None:
+                    raise KeyError("snapshot ledger head is not in this chain")
+            # Reproduce the fold exactly as _refold does: silence retracted
+            # sources and exclude redacted payloads, or the snapshot recomputes a
+            # different number than the one it recorded (I8 — a retracted source
+            # would otherwise speak again).
             redacted = self._redacted_payloads()
+            retracted = self._retracted_actors()
             for ev in events:
-                if cutoff is not None and ev.seq > cutoff:
+                if ev.seq > cutoff:
                     break
-                payload = (None if ev.payload_hash in redacted
+                silenced = ev.actor in retracted and ev.kind != "retraction"
+                payload = (None if silenced or ev.payload_hash in redacted
                            else self.ledger.payload(ev.payload_hash))
                 apply_mod.apply_event(tmp_index, ev, payload)
+            # The curiosity sweep is a deterministic function of the folded
+            # observations; _refold runs it, so predict_at must too or it drops
+            # the under_specified / narrow caveats the live prediction carried.
+            curiosity_mod.sweep(tmp_index)
             clo = apply_mod.rebuild_closure(tmp_index)
             tmp_index.commit()
             calib = calibration_mod.IsotonicMap.from_json(snap.get("calib_map"))
