@@ -273,22 +273,29 @@ class CandorSystem:
 
     def observe(self, stmt: Mapping[str, Any], outcome: bool,
                 ctx: Mapping[str, str], actor: str,
-                confidence: Optional[float] = None) -> int:
+                confidence: Optional[float] = None,
+                ts: Optional[int] = None) -> int:
         self._check_quota(actor, "observation")
         payload = {"stmt": {"pred": stmt["pred"], "args": list(stmt["args"])},
                    "outcome": bool(outcome), "ctx": dict(ctx or {}),
                    "grade": reliability_mod.grade_of(confidence),
                    "confidence": confidence}
+        # A historical replay passes the real event time so a located changepoint
+        # gets the real valid_to; ts=None keeps the ingest wall clock (§3.1).
         ev = self.ledger.append("observation", actor, payload,
-                                context_sig=context_signature(ctx))
+                                context_sig=context_signature(ctx), ts=ts)
         apply_mod.apply_event(self.index, ev, payload)
         self.index.commit()
         return ev.seq
 
-    def observe_batch(self, obs: Sequence[tuple[Mapping[str, Any], bool,
-                                                Mapping[str, str], str]]) -> list[int]:
-        out = [self.observe(stmt, outcome, ctx, actor)
-               for stmt, outcome, ctx, actor in obs]
+    def observe_batch(self, obs: Sequence[Sequence[Any]]) -> list[int]:
+        """Batch observe. Each tuple is (stmt, outcome, ctx, actor) or, to stamp
+        a historical event time, (stmt, outcome, ctx, actor, ts)."""
+        out: list[int] = []
+        for item in obs:
+            stmt, outcome, ctx, actor = item[0], item[1], item[2], item[3]
+            ts = item[4] if len(item) > 4 else None
+            out.append(self.observe(stmt, outcome, ctx, actor, ts=ts))
         return out
 
     def pin(self, target_id: str, polarity: str, reason: str, authority: str) -> int:
