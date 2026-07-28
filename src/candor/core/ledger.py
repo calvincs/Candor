@@ -105,6 +105,11 @@ class Ledger:
         self._fh_path: Optional[Path] = None
         self._lines_in_seg = 0
         self._lock_fh = None
+        # Cache the tail segment so append() never globs the directory. It is
+        # authoritative only because §7 guarantees a single writer; it is
+        # rebuilt from disk in _recover(), reset in destroy(), and advanced on
+        # rollover in _open_tail(). Nothing else changes segment structure.
+        self._tail_path: Optional[Path] = None
 
     # ── writer lock (§7 single writer) ────────────────────────────────────────
     def _acquire_lock(self) -> None:
@@ -162,6 +167,7 @@ class Ledger:
                 for p in sorted(d.iterdir()):
                     p.unlink()
         self._head, self._seq, self._lines_in_seg = GENESIS, 0, 0
+        self._tail_path = None
 
     # ── recovery (§3.1 torn-write) ───────────────────────────────────────────
     def _segments(self) -> list[Path]:
@@ -221,19 +227,23 @@ class Ledger:
         self._seq = seq
         self._lines_in_seg = 0
         segs = self._segments()
+        self._tail_path = segs[-1] if segs else None
         if segs:
             self._lines_in_seg = sum(1 for _ in segs[-1].open("rb"))
 
     # ── append ───────────────────────────────────────────────────────────────
     def _open_tail(self):
-        segs = self._segments()
-        if not segs or self._lines_in_seg >= SEGMENT_LINES:
-            idx = (int(segs[-1].stem) + 1) if segs else 1
+        # The tail path is cached (_recover rebuilds it from disk); rollover is
+        # the only steady-state event that changes it, so append() no longer
+        # globs the segments directory on every call.
+        if self._tail_path is None or self._lines_in_seg >= SEGMENT_LINES:
+            idx = (int(self._tail_path.stem) + 1) if self._tail_path is not None else 1
             path = self.seg_dir / f"{idx:06d}.jsonl"
             path.touch()
             self._lines_in_seg = 0
+            self._tail_path = path
         else:
-            path = segs[-1]
+            path = self._tail_path
         if self._fh_path != path:
             if self._fh is not None:
                 self._fh.flush()
