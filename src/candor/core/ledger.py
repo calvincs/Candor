@@ -169,6 +169,13 @@ class Ledger:
                     seg.write_bytes(bytes(keep))
                 else:
                     seg.unlink()
+            elif bytes(keep) != raw:
+                # H5: the segment verifies but was not byte-identical to what we
+                # will keep — e.g. the last line lost only its trailing "\n".
+                # Persist the normalized bytes so the last line always ends in
+                # "\n"; otherwise the next append() merges onto it and the chain
+                # can no longer be parsed.
+                seg.write_bytes(bytes(keep))
         self._head = prev
         self._seq = seq
         self._lines_in_seg = 0
@@ -281,14 +288,19 @@ class Ledger:
 
     def verify_chain(self) -> bool:
         prev, seq = GENESIS, 0
-        for ev in self.read_all():
-            if ev.prev_hash != prev or ev.seq != seq + 1:
-                return False
-            if ev.hash != _event_hash(ev.seq, ev.ts, ev.kind, ev.actor,
-                                      ev.payload_hash, ev.source_ref,
-                                      ev.context_sig, ev.prev_hash):
-                return False
-            prev, seq = ev.hash, ev.seq
+        # H5: a corrupt/unparseable/garbage tail must yield False, never raise.
+        # read_all() parses lines lazily, so wrap the whole traversal.
+        try:
+            for ev in self.read_all():
+                if ev.prev_hash != prev or ev.seq != seq + 1:
+                    return False
+                if ev.hash != _event_hash(ev.seq, ev.ts, ev.kind, ev.actor,
+                                          ev.payload_hash, ev.source_ref,
+                                          ev.context_sig, ev.prev_hash):
+                    return False
+                prev, seq = ev.hash, ev.seq
+        except Exception:
+            return False
         return prev == self._head
 
     # ── test-only fault injection support (§6.1) ─────────────────────────────
