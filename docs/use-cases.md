@@ -1,0 +1,82 @@
+# Use cases
+
+Three patterns this substrate is actually for, each mapped to a runnable
+example.
+
+## 1. Agent memory that can be audited (and survive a bad source)
+
+**The problem.** Your agent stores "facts" from tools, web pages, and its own
+inferences. Six weeks later it confidently repeats something a hallucinating
+scraper told it in March, and you can't find where the belief came from or
+what else it contaminated.
+
+**The CANDOR shape.** Every ingest is an attributed candidate through the
+gate; every tool report is an attributed observation. When you discover the
+March scraper was bad, you have two scalpels, both reversible:
+
+```python
+m.set_reliability("tool:bad-scraper", "external", 0.001, 100)  # discount it...
+m.redact(payload_hash)                                         # ...or purge the payload
+h = m.replay()   # every downstream number recomputes as if it never spoke
+```
+
+Nothing else in the store is touched, because no number was ever stored — only
+integer counts keyed by who reported them. See `examples/quickstart.py`.
+
+## 2. Source-reliability tracking: trust that is earned, asymmetric, and cheap
+
+**The problem.** You aggregate judgements from multiple LLMs, tools, and
+heuristics of very different quality — including some that are biased rather
+than merely noisy. Averaging treats a sycophant like a scientist.
+
+**The CANDOR shape.** Let every judge vote (optionally with confidence), then
+settle a training slice of claims against ground truth. The confusion ledgers
+learn each source's *shape*, not just its accuracy: the always-yes agent's
+"yes" ends up carrying a likelihood ratio of ~1.0 (worthless) while its rare
+"no" becomes decisive; correlated judges sharing evidence get priced
+sub-additively instead of double-counted. Measured on our benchmark, this
+composition beat plain vote-averaging by 0.04 Brier with a confidence
+interval nowhere near zero. See `examples/source_reliability.py`.
+
+**Fits:** LLM-as-judge ensembles, moderation pipelines, multi-tool RAG
+verification, human+model hybrid review queues.
+
+## 3. Drift detection with dates: "what changed, and when?"
+
+**The problem.** Your pipelines degrade silently. A site adds bot protection;
+a dependency fixes itself after an upgrade; a model's behaviour shifts. Decay-
+weighted averages just get vaguely worse; they never *say* anything.
+
+**The CANDOR shape.** Feed outcome events with wide context. The curiosity
+sweep separates three situations that look identical to an average:
+
+- a **condition** — success depends on a recorded covariate → proposes a
+  guard ("works when method=crawl4ai"), which must survive BH correction, an
+  MDL check, and held-out validation;
+- a **regime change** — a one-way step → proposes a valid-time supersede with
+  the change *located to a date*; old counts stay with the old regime;
+- **unexplained variance** — opens a question carrying the residual partition
+  and a concrete suggested measurement, re-tested automatically when a new
+  covariate starts being recorded.
+
+On its first run over a real agent's operational history this located a tool
+repair (0%→79% on 2026-04-30) and a search-reliability collapse (93%→38% on
+2026-04-22), both corroborated by the agent's own notes — and rejected two
+plausible-looking rules that failed held-out validation. See
+`examples/regime_change.py`.
+
+**Fits:** scraper/API health, CI flakiness forensics, feed-quality
+monitoring, any place "it used to work" is a bug report.
+
+## Anti-use-cases (read before adopting)
+
+- **Not a vector database.** The optional dense ranker helps `recall`, but if
+  semantic search is the whole job, use a vector store.
+- **Not a query-time oracle.** Our own benchmark showed that if you can afford
+  a top-tier model reading full evidence fresh on every question, it will beat
+  stored sparse witnesses on raw Brier. CANDOR's trade is provenance,
+  per-source learning, and ~free reads — not beating a fresh reader.
+- **Not distributed.** Single writer, single sequencer, one box. By design,
+  for v1.
+- **Binary outcomes only** in v1 — scalar outcomes (latencies, scores) need
+  binarizing at the boundary.

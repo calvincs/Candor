@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.hypothesis/
+# All benchmark/run data stays local: corpora and observation streams are
+# derived from private sources and must never be committed.
+data/
