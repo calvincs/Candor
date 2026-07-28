@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +26,15 @@ from typing import Any, Iterator, Optional
 from .hashing import GENESIS, canon_json, hash_obj, sha256_hex
 
 SEGMENT_LINES = 4096
+
+# A CAS key is exactly a lowercase sha256 hex digest (what hash_obj produces).
+# Anything else must never be interpolated into `cas_dir / f"{h}.json"`: a value
+# containing `..` would escape the payload directory (M4 path traversal).
+_PAYLOAD_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def is_payload_hash(value: Any) -> bool:
+    return isinstance(value, str) and _PAYLOAD_HASH_RE.match(value) is not None
 
 # Kinds admitted to the chain (spec §2 `events.kind` CHECK constraint).
 EVENT_KINDS = frozenset({
@@ -247,12 +257,20 @@ class Ledger:
                                 rec["context_sig"], rec["prev_hash"], rec["hash"])
 
     def payload(self, payload_hash: str) -> Optional[Any]:
+        # Refuse to interpolate anything but a real digest into the CAS path
+        # (M4): a non-hash cannot name a stored payload anyway, so a safe no-op.
+        if not is_payload_hash(payload_hash):
+            return None
         path = self.cas_dir / f"{payload_hash}.json"
         if not path.exists():
             return None
         return json.loads(path.read_text(encoding="utf-8"))
 
     def delete_payload(self, payload_hash: str) -> bool:
+        # Defense in depth (M4): never unlink a path built from a non-digest,
+        # which could contain `..` and escape cas_dir. A no-op, cannot escape.
+        if not is_payload_hash(payload_hash):
+            return False
         path = self.cas_dir / f"{payload_hash}.json"
         if path.exists():
             path.unlink()

@@ -28,7 +28,7 @@ from .core.committed import facts as facts_mod
 from .core.committed import reliability as reliability_mod
 from .core.hashing import canon_json, sha256_hex
 from .core.index import Index
-from .core.ledger import Ledger
+from .core.ledger import Ledger, is_payload_hash
 from .periphery import conjecture as conjecture_mod
 from .periphery import curiosity_engine as curiosity_mod
 from .periphery import embedder as embedder_mod
@@ -383,6 +383,13 @@ class CandorSystem:
         loses its payload, whoever wrote it. See `redaction_scope` for the
         blast radius, and `retract_source` to silence a single actor instead.
         """
+        # Reject a bad hash at the boundary, before appending anything (M4):
+        # the argument flows into `cas_dir / f"{payload_hash}.json"`, so a value
+        # with `..` in it would unlink a file outside the store.
+        if not is_payload_hash(payload_hash):
+            raise ValueError(
+                "payload_hash must be a 64-char lowercase sha256 hex digest, "
+                f"got {payload_hash!r}")
         scope = self.redaction_scope(payload_hash)
         if scope["shared"]:
             apply_mod.diagnostic(self.index, 0, "redaction_shared_payload", scope)
