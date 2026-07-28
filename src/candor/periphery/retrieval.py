@@ -21,7 +21,7 @@ import sqlite3
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 TOKEN = re.compile(r"[A-Za-z0-9_.:-]+")
 SUBSPLIT = re.compile(r"[._:\-]+")
@@ -119,72 +119,127 @@ class Retriever:
         # same standing as @salience; absent or failing, ranking is lexical.
         self.dense = dense
         self._dense_vectors: dict[str, list[float]] = {}
-        # Corpus statistics are query-independent, so recomputing them per call
-        # made retrieval O(corpus) in file reads for every question. The cache
-        # is invalidated by the (mtime, size) fingerprint of both directories,
-        # so an appended entry is picked up on the next call. Scoring is
-        # unchanged — this is memoization, not a ranking change.
-        self._index: Optional[tuple[Any, list[EvidenceEntry], list[list[str]],
-                                    Counter, float]] = None
+        # Incremental corpus index (H7). Rebuilding the whole index on every
+        # call made an appended entry cost O(corpus): a single new payload
+        # changed the directory fingerprint and forced a from-scratch re-read +
+        # re-tokenize + BM25 rebuild of EVERY document. Instead the index is
+        # maintained per file: only new/changed files are read and tokenized,
+        # and a file that disappears (redaction, §3.1/§6.6) is evicted. Corpus
+        # statistics (df, doc-length sum) are updated incrementally, so scoring
+        # sees exactly what a full rebuild would — this stays memoization, not a
+        # ranking change. Keyed by a cheap (mtime_ns, size) stamp so unchanged
+        # files are never re-read.
+        self._files: dict[Path, tuple[tuple[int, int], str,
+                                      list[EvidenceEntry], list[list[str]]]] = {}
+        self._df: Counter = Counter()
+        self._doclen_sum: int = 0
+        self._flat_entries: Optional[list[EvidenceEntry]] = None
+        self._flat_docs: list[list[str]] = []
+        self._avgdl: float = 1.0
 
-    def _fingerprint(self) -> tuple:
-        stamps = []
-        for directory, pattern in ((self.evidence_dir, "**/*.md"),
-                                   (self.payload_dir, "*.json")):
+    def _scan(self) -> dict[Path, tuple[tuple[int, int], str]]:
+        """Cheap directory census: stat only, never read or tokenize.
+
+        Returns each present file's (mtime_ns, size) stamp and its origin. This
+        is what lets an appended file be detected, and a deleted one evicted,
+        without touching the O(corpus) files whose stamp is unchanged.
+        """
+        current: dict[Path, tuple[tuple[int, int], str]] = {}
+        for directory, pattern, origin in (
+                (self.evidence_dir, "**/*.md", "evidence"),
+                (self.payload_dir, "*.json", "payload")):
             if not directory.exists():
-                stamps.append((str(directory), 0, 0))
                 continue
-            paths = sorted(directory.glob(pattern))
-            newest = max((p.stat().st_mtime_ns for p in paths), default=0)
-            stamps.append((str(directory), len(paths), newest))
-        return tuple(stamps)
+            for path in directory.glob(pattern):
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                current[path] = ((st.st_mtime_ns, st.st_size), origin)
+        return current
+
+    def _evict(self, path: Path) -> None:
+        _stamp, _origin, _entries, docs = self._files.pop(path)
+        for doc in docs:
+            self._doclen_sum -= len(doc)
+            for term in set(doc):
+                remaining = self._df[term] - 1
+                if remaining <= 0:
+                    del self._df[term]
+                else:
+                    self._df[term] = remaining
+
+    def _ingest(self, path: Path, stamp: tuple[int, int], origin: str) -> None:
+        entries = (self._entries_for_evidence(path) if origin == "evidence"
+                   else self._entries_for_payload(path))
+        docs = [tokenize(e.text) for e in entries]
+        for doc in docs:
+            self._doclen_sum += len(doc)
+            self._df.update(set(doc))
+        self._files[path] = (stamp, origin, entries, docs)
 
     def _corpus(self) -> tuple[list[EvidenceEntry], list[list[str]],
                                Counter, float]:
-        fingerprint = self._fingerprint()
-        if self._index is not None and self._index[0] == fingerprint:
-            return self._index[1], self._index[2], self._index[3], self._index[4]
-        entries = list(self._evidence_entries()) + list(self._payload_entries())
-        docs = [tokenize(e.text) for e in entries]
-        df: Counter = Counter()
-        for doc in docs:
-            df.update(set(doc))
-        avgdl = (sum(len(d) for d in docs) / len(docs)) if docs else 1.0
-        self._index = (fingerprint, entries, docs, df, avgdl)
-        return entries, docs, df, avgdl
+        current = self._scan()
+        changed = False
+        for path in list(self._files):
+            stamp = self._files[path][0]
+            seen = current.get(path)
+            if seen is None or seen[0] != stamp:   # gone or edited → drop it
+                self._evict(path)
+                changed = True
+        for path, (stamp, origin) in current.items():
+            if path not in self._files:            # new or just-evicted-changed
+                self._ingest(path, stamp, origin)
+                changed = True
+        if changed or self._flat_entries is None:
+            self._rebuild_flat()
+        return self._flat_entries, self._flat_docs, self._df, self._avgdl
+
+    def _rebuild_flat(self) -> None:
+        """Flatten per-file records into the (entries, docs) lists the scorer
+        walks. Evidence before payloads, each path-sorted — the exact order a
+        `_evidence_entries() + _payload_entries()` full build produced.
+        """
+        entries: list[EvidenceEntry] = []
+        docs: list[list[str]] = []
+        for path in sorted(self._files,
+                           key=lambda p: (self._files[p][1] != "evidence", str(p))):
+            _stamp, _origin, file_entries, file_docs = self._files[path]
+            entries.extend(file_entries)
+            docs.extend(file_docs)
+        self._flat_entries = entries
+        self._flat_docs = docs
+        self._avgdl = (self._doclen_sum / len(docs)) if docs else 1.0
 
     # ── corpus ──────────────────────────────────────────────────────────────
-    def _evidence_entries(self) -> Iterable[EvidenceEntry]:
-        if not self.evidence_dir.exists():
-            return
-        for path in sorted(self.evidence_dir.glob("**/*.md")):
-            try:
-                text = path.read_text(encoding="utf-8")
-            except OSError:
-                continue
-            meta: dict[str, Any] = {}
-            for line in text.splitlines():
-                m = re.match(r"^@(\w+):\s*(.*)$", line.strip())
-                if m:
-                    meta[m.group(1)] = m.group(2)
-            offset = 0
-            for i, chunk in enumerate(text.split("\n\n")):
-                if chunk.strip():
-                    # hash exactly the text stored, or every re-hash misses
-                    yield EvidenceEntry(
-                        f"{path.stem}#{i}", _content_hash(chunk.strip()), offset,
-                        chunk.strip(), meta, "evidence")
-                offset += len(chunk) + 2
+    def _entries_for_evidence(self, path: Path) -> list[EvidenceEntry]:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return []
+        meta: dict[str, Any] = {}
+        for line in text.splitlines():
+            m = re.match(r"^@(\w+):\s*(.*)$", line.strip())
+            if m:
+                meta[m.group(1)] = m.group(2)
+        out: list[EvidenceEntry] = []
+        offset = 0
+        for i, chunk in enumerate(text.split("\n\n")):
+            if chunk.strip():
+                # hash exactly the text stored, or every re-hash misses
+                out.append(EvidenceEntry(
+                    f"{path.stem}#{i}", _content_hash(chunk.strip()), offset,
+                    chunk.strip(), meta, "evidence"))
+            offset += len(chunk) + 2
+        return out
 
-    def _payload_entries(self) -> Iterable[EvidenceEntry]:
-        if not self.payload_dir.exists():
-            return
-        for path in sorted(self.payload_dir.glob("*.json")):
-            try:
-                text = path.read_text(encoding="utf-8")
-            except OSError:
-                continue
-            yield EvidenceEntry(path.stem, path.stem, 0, text, {}, "payload")
+    def _entries_for_payload(self, path: Path) -> list[EvidenceEntry]:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return []
+        return [EvidenceEntry(path.stem, path.stem, 0, text, {}, "payload")]
 
     # ── ranking ─────────────────────────────────────────────────────────────
     def _score_pass(self, terms: list[tuple[str, float]], entries, docs, df,
