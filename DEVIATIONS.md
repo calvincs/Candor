@@ -453,3 +453,46 @@ Relatedly, the hash chain is a *consistency* mechanism, not tamper-evidence — 
 writer who can edit a segment can recompute it — so tamper-evidence against that
 threat is left to an external anchor of `ledger_head()`.
 Evidence: `SECURITY.md`; `tests/unit/test_authz_m3.py`.
+
+### D28 — the sweep searches synthesized frames, not just recorded context
+§4.5 scopes the covariate search to recorded `obs_context` keys. v0.6 Δ10
+extends it: hour/dow from the event ts, the fact's previous outcome, and
+pairwise interactions of recorded keys are synthesized per fact and tested by
+the identical Tarone→BH→MDL→held-out flow. Two conservatisms are ours, not the
+spec's: recorded keys outrank derived ones at winner selection, and
+`derived:prev` is disqualified when a one-way changepoint exists or when either
+prev-conditioned subseries still carries temporal structure (self-lag shadows a
+date or an unlogged block variable otherwise). Breadth stays recorded-only.
+All of it is a pure per-fact function of the log, so H6b/I3/I8 hold.
+Evidence: `docs/spec-v0.6-delta.md`; `tests/unit/test_derived_keys.py`.
+
+### D29 — §3.4 demotion is finally load-bearing, with evidence measured in nats
+The spec promised "demotion runs the same path backward with a strictly higher
+bar" and the fold always knew the `demotion` event — but nothing ever appended
+one. v0.6 Δ11 activates it via the prospective audit in `run_gate`. One
+interpretive choice: the hysteresis comparison uses signed binomial
+log-likelihood-vs-chance ("nats", `gate.direction_evidence`), because the naive
+count-odds ratio saturates with sample size and makes any hysteresis bar
+unreachable. Second choice: staleness (direction stops beating chance on twice
+the entry evidence) demotes alongside reversal — a rent check, not just a
+falsification check. Re-entry is judged on post-demotion evidence only.
+Evidence: `tests/unit/test_guard_prospective_audit.py`.
+
+### D30 — committed conjectures transfer the analog's probability, not similarity
+§4.3 defines conjectures as read-only proposals. v0.6 Δ12 adds an opt-in commit
+path through the claims machinery. The deviation-worthy decision: a conjecture
+claim's `predicted_p` is `predict(via).p` — the analog's earned number moved
+across the soft edge — never the cosine similarity, which is a licence, not a
+probability. The engine calibrates under its own `conjecture/v1` class (I9) and
+a true settlement implements the postulate through the gate (I10).
+Evidence: `tests/unit/test_conjecture_claims.py`.
+
+### D31 — `do:` is vocabulary for intervention, deliberately not a causal model
+v0.6 Δ13 reserves the `do:` context prefix. We chose surfacing over inference:
+mixed-regime predictions still report the pooled marginal (predictions are
+unconditional by architecture) with a loud `regime_mixed` caveat, and a guard
+on a `do:` key is labeled regime dependence rather than becoming a conditional
+prediction. Predicting what an intervention will change before
+post-intervention data exists is out of scope by design — the claims-suite
+battery asserts that boundary so it stays a measured fact about this system.
+Evidence: `tests/unit/test_do_semantics.py`; `tests/claims/test_axiom_battery.py`.

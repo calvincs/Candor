@@ -27,6 +27,12 @@ DEFAULT_PREDICTOR_CLASS = "wmc-two-loop/v1"
 # predictions never pool with the scalar wmc-two-loop path (I9) — a categorical
 # prediction is a distribution over an open vocabulary, not a scalar p.
 CATEGORICAL_PREDICTOR_CLASS = "categorical/v1"
+# Δ12: committed conjectures are claims whose predicted_p is TRANSFERRED across
+# a behavioral-similarity edge, not computed by the WMC engine — a distinct
+# class, so the analogy engine's track record calibrates on its own and never
+# pools with either path above (I9). Its curve IS "how much is an analogy
+# worth here", measured.
+CONJECTURE_PREDICTOR_CLASS = "conjecture/v1"
 
 
 def bucket_of(p: float) -> int:

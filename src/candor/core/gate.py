@@ -40,6 +40,10 @@ DEMOTION_HYSTERESIS = 3.0
 ALIAS_SIM_THRESHOLD = 0.85
 # §4.5 guard gate: minimum support per partition.
 GUARD_MIN_SUPPORT = 8
+# Δ11: staleness demotion needs this multiple of the audit floor before "fails
+# to beat chance" counts — removal on staleness requires strictly more evidence
+# than entry did (hysteresis in sample size where the effect size is null).
+STALE_AUDIT_FACTOR = 2
 
 
 @dataclass
@@ -221,6 +225,9 @@ def _evaluate_rule(idx: "Index", cid: str, kind: str,
                        f"held-out evidence check failed ({hits} hits / "
                        f"{misses} misses)")
     if kind == "guard":
+        blocked = _demoted_reentry_block(idx, body)
+        if blocked:
+            return _reject(cid, "guard", 4, blocked)
         support = body.get("support") or {}
         if min(int(support.get("left", 0)), int(support.get("right", 0))) < GUARD_MIN_SUPPORT:
             return _reject(cid, "guard", 5,
@@ -327,3 +334,85 @@ def demotion_warranted(admission_log_odds: float, against_log_odds: float) -> bo
     """§3.4 hysteresis: the bar for removal is strictly higher than for entry."""
     import math
     return against_log_odds > admission_log_odds + math.log(DEMOTION_HYSTERESIS)
+
+
+def direction_evidence(right: int, wrong: int) -> float:
+    """Accumulated evidence (nats) that a guard's direction beats chance: the
+    binomial log-likelihood ratio of the observed record against p=1/2, at the
+    smoothed MLE. Grows with sample size — unlike a count-odds RATIO, which
+    saturates and would make any hysteresis bar unreachable — so 'the evidence
+    against must exceed the evidence that admitted it' means what it says.
+    SIGNED: a record whose majority runs the other way scores negative — the
+    deviation-from-chance strength alone is direction-blind and would count a
+    resoundingly WRONG record as support. Zero on an empty record; ~0 on a
+    chance-rate record of any size."""
+    n = right + wrong
+    if n == 0:
+        return 0.0
+    p = (right + 0.5) / (n + 1.0)
+    llr = right * math.log(2.0 * p) + wrong * math.log(2.0 * (1.0 - p))
+    return llr if right >= wrong else -llr
+
+
+def _demoted_reentry_block(idx: "Index", body: dict[str, Any]) -> Optional[str]:
+    """Δ11 anti-flap: re-entry after a prospective demotion needs FRESH evidence.
+
+    The sweep is memoryless — a demoted guard is re-proposed on the next pass
+    from the very history that admitted it the first time, and a full-history
+    holdout is dominated by the era when the guard genuinely worked, so judging
+    the re-proposal on it would flap admit→demote→admit forever. Re-entry
+    evidence must instead come from observations the demotion never judged:
+    the harness attaches the POST-DEMOTION record (`body["post_demotion"]`,
+    scored by the same machinery as the audit) before evaluation, and §3.4's
+    hysteresis runs forward — that record's direction evidence must exceed the
+    demotion's against-evidence by DEMOTION_HYSTERESIS. No scorable
+    post-demotion record yet means no re-entry yet: a demoted guard returns on
+    new data or not at all. (Without an attached record — a caller asserting a
+    guard directly — the entry holdout is compared instead, the conservative
+    fallback.) The latest matching demotion decides.
+    """
+    target = body.get("target_fact")
+    ck = body.get("conditioning_key")
+    guards = (body.get("body") or {}).get("guards") or []
+    value = guards[0].get("value") if guards else None
+    if target is None or ck is None:
+        return None
+    latest: Optional[dict[str, Any]] = None
+    for row in idx.query(
+            "SELECT body_json, reason FROM candidates "
+            "WHERE kind='guard' AND status='demoted' ORDER BY event_seq"):
+        prior = json.loads(row["body_json"])
+        pguards = (prior.get("body") or {}).get("guards") or []
+        if (prior.get("target_fact") == target
+                and prior.get("conditioning_key") == ck
+                and pguards and pguards[0].get("value") == value):
+            try:
+                latest = json.loads(row["reason"] or "{}")
+            except ValueError:
+                latest = {}
+    if latest is None:
+        return None
+    against = direction_evidence(int(latest.get("misses", 0)),
+                                 int(latest.get("hits", 0)))
+    if "post_demotion" in body:
+        pd = body.get("post_demotion")
+        if not pd:
+            return ("guard was demoted on prospective evidence; re-entry "
+                    "requires a scorable post-demotion record and none exists "
+                    "yet")
+        entry = direction_evidence(int(pd.get("hits", 0)),
+                                   int(pd.get("misses", 0)))
+        basis = (f"post-demotion record {pd.get('hits', 0)} hits / "
+                 f"{pd.get('misses', 0)} misses")
+    else:
+        holdout = body.get("holdout") or {}
+        entry = direction_evidence(int(holdout.get("hits", 0)),
+                                   int(holdout.get("misses", 0)))
+        basis = (f"holdout {holdout.get('hits', 0)} hits / "
+                 f"{holdout.get('misses', 0)} misses")
+    if not entry > against + math.log(DEMOTION_HYSTERESIS):
+        return (f"guard was demoted ({latest.get('hits', 0)} hits / "
+                f"{latest.get('misses', 0)} misses post-admission); re-entry "
+                f"evidence ({basis}) does not overcome it by the demotion "
+                f"hysteresis")
+    return None

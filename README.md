@@ -23,6 +23,17 @@ lab notebook:
   hunts the missing variable, and proposes *conditions* ("works **when**
   method=crawl4ai"). When something changes for good, it finds the date:
   regime changes are located, not decayed away.
+- **It postulates frames nobody logged — and its rules keep paying rent.**
+  The hunt isn't limited to context you recorded: the sweep also tests
+  hour-of-day, the fact's own previous outcome, and interactions of recorded
+  keys, through the same gate. Every admitted condition keeps being scored on
+  the observations that arrive *after* it; one whose direction reverses or
+  goes stale is demoted through the same ledger that admitted it. Analogical
+  conjectures become claims whose track record is measured — and only a
+  settled-true conjecture may become a fact, through the gate like everything
+  else. Context keys marked `do:` separate *acting* from *watching*: a
+  coupling that holds only outside intervention is labeled regime-dependent,
+  and a prediction pooling across that boundary says so.
 - **It knows what it hasn't seen.** Beyond true/false, a fact can record an
   *open-vocabulary* categorical outcome (which of many values happened), and the
   vocabulary grows as new values appear. The distribution carries a first-class
@@ -109,10 +120,14 @@ failures and what each one taught, is in [docs/benchmarks.md](docs/benchmarks.md
 ## Status
 
 Fully conformant against the spec through Stage 5 (23 conformance gates green),
-backed by 443 additive unit tests (1 xfail-by-design) and 35 claims tests
+backed by 474 additive unit tests (1 xfail-by-design) and 41 claims tests
 holding this page to its word. Spec v0.2 plus adopted deltas v0.3 / v0.4 / v0.5
-(v0.5 adds open-vocabulary categorical facts with a first-class unknown mass and
-read-time distribution surfacing). Single-writer, single-box by design —
+/ v0.6 (v0.5 adds open-vocabulary categorical facts with a first-class unknown
+mass and read-time distribution surfacing; v0.6 adds derived context frames,
+the prospective guard audit, committed conjectures, and `do:` intervention
+semantics — see [docs/spec-v0.6-delta.md](docs/spec-v0.6-delta.md), including
+the stated limit: none of it predicts what an intervention will change before
+post-intervention data exists). Single-writer, single-box by design —
 distributed consensus is an explicit non-goal for v1.
 
 Six defects have been found by the claims suite and fixed, each recorded with

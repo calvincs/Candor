@@ -10,6 +10,7 @@ construction (I1, I3).
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import tempfile
 import time
@@ -28,7 +29,7 @@ from .core.canonical import context_signature, fact_key
 from .core.committed import counts as counts_mod
 from .core.committed import facts as facts_mod
 from .core.committed import reliability as reliability_mod
-from .core.hashing import GENESIS
+from .core.hashing import GENESIS, canon_json
 from .core.index import Index
 from .core.ledger import Ledger, is_payload_hash
 from .periphery import conjecture as conjecture_mod
@@ -128,6 +129,9 @@ class CandorSystem:
         # it would re-propose byte-identical candidates — an idle run_gate can
         # skip it. None until the first sweep actually runs.
         self._sweep_obs_watermark: Optional[int] = None
+        # Δ11: same idea for the prospective guard audit — its verdicts depend
+        # only on observations, so with no new observation nothing can change.
+        self._audit_obs_watermark: Optional[int] = None
         # M3: optional authorization policy for privileged writes. None means
         # advisory (the default posture): `authority`/`actor` are attribution
         # labels only. A policy is a callable (principal, op) -> bool; see
@@ -151,6 +155,7 @@ class CandorSystem:
         self._closure = None
         self._health_events = deque(maxlen=_HEALTH_EVENTS_CAP)
         self._sweep_obs_watermark = None
+        self._audit_obs_watermark = None
         self.ledger.open()
 
     def close(self) -> None:
@@ -420,6 +425,13 @@ class CandorSystem:
         candidates from `assert_` are always processed.
         """
         obs_seq = self._max_observation_seq()
+        # Δ11: audit admitted guards BEFORE the sweep re-proposes anything, so a
+        # demotion is on the books when the memoryless re-proposal reaches the
+        # gate in this same call — the re-entry bar sees it, no flap window.
+        audit_runs: list[dict[str, Any]] = []
+        if obs_seq != self._audit_obs_watermark:
+            audit_runs = self._audit_admitted_guards()
+            self._audit_obs_watermark = obs_seq
         if obs_seq != self._sweep_obs_watermark:
             for kind, body in curiosity_mod.sweep(self.index):
                 ev = self.ledger.append("assertion", "agent:curiosity",
@@ -428,12 +440,18 @@ class CandorSystem:
                 apply_mod.apply_event(self.index, ev,
                                       {"candidate_kind": kind, "body": body})
             self._sweep_obs_watermark = obs_seq
-        runs: list[dict[str, Any]] = []
+        runs: list[dict[str, Any]] = list(audit_runs)
         pending = self.index.query(
             "SELECT id, kind, body_json, proposer FROM candidates "
             "WHERE status='pending' ORDER BY event_seq")
         for row in pending:
             body = json.loads(row["body_json"])
+            if row["kind"] == "guard":
+                # Δ11: a re-proposal of a demoted direction is judged on FRESH
+                # evidence — attach the post-demotion record (periphery scores,
+                # the gate decides, the decision is recorded; replay folds it
+                # without re-judging).
+                self._attach_post_demotion_record(body)
             decision = gate_mod.evaluate(self.index, row["id"], row["kind"], body,
                                          row["proposer"])
             gate_run_id = apply_mod.gate_run_id_for(self.ledger.seq() + 1)
@@ -455,6 +473,111 @@ class CandorSystem:
         self._closure = None
         self.index.commit()
         return runs
+
+    def _attach_post_demotion_record(self, body: dict[str, Any]) -> None:
+        """Δ11: when a guard candidate matches a previously demoted direction,
+        score that direction on the observations AFTER the latest demotion and
+        attach it as body["post_demotion"] (None when nothing is scorable yet).
+        The gate's re-entry bar judges THIS record instead of the full-history
+        holdout the sweep computed — the flap-proof evidence."""
+        guards = (body.get("body") or {}).get("guards") or []
+        target = body.get("target_fact")
+        ck = body.get("conditioning_key")
+        if not guards or not target or not ck:
+            return
+        value = guards[0].get("value")
+        at: Optional[int] = None
+        for r in self.index.query(
+                "SELECT body_json, reason FROM candidates "
+                "WHERE kind='guard' AND status='demoted' ORDER BY event_seq"):
+            prior = json.loads(r["body_json"])
+            pguards = (prior.get("body") or {}).get("guards") or []
+            if (prior.get("target_fact") == target
+                    and prior.get("conditioning_key") == ck
+                    and pguards and pguards[0].get("value") == value):
+                try:
+                    at = int(json.loads(r["reason"] or "{}").get("at", 0))
+                except (ValueError, TypeError):
+                    at = 0
+        if at is None:
+            return
+        score = curiosity_mod.prospective_guard_score(self.index, body, at)
+        body["post_demotion"] = (
+            {"hits": score[0], "misses": score[1]} if score else None)
+
+    def _audit_admitted_guards(self) -> list[dict[str, Any]]:
+        """Δ11 — the prospective audit: admitted guards must keep paying rent.
+
+        The entry holdout validated a guard once, retrospectively, on data that
+        existed at proposal time. This scores every admitted guard on the
+        observations that arrived AFTER its admission — predictions it actually
+        risked — and demotes it through the ledger when either signal fires:
+
+          * REVERSAL: the post-admission direction is wrong at the §3.4
+            hysteresis bar (`demotion_warranted` over admission-vs-against
+            log-odds) — the condition flipped under it;
+          * STALENESS: the direction stops beating chance (hits <= misses) on
+            STALE_AUDIT_FACTOR times the audit floor — removal on a null effect
+            needs strictly more evidence than entry did.
+
+        The demotion event carries the scored record; the fold marks the rule
+        'candidate' (out of the closure and the read paths) and the candidate
+        row 'demoted' with the against-evidence, which the gate's re-entry bar
+        then holds future re-proposals to. Trusted-side decision over an
+        untrusted-side score, appended and folded like every structural change
+        — replay reproduces it without re-judging (§3.4).
+        """
+        demoted: list[dict[str, Any]] = []
+        rows = self.index.query(
+            "SELECT id, gate_run_id, body_json FROM candidates "
+            "WHERE kind='guard' AND status='admitted' ORDER BY event_seq")
+        for row in rows:
+            gate_run = row["gate_run_id"] or ""
+            try:
+                admitted_seq = int(gate_run.split(":", 1)[1])
+            except (IndexError, ValueError):
+                continue
+            body = json.loads(row["body_json"])
+            score = curiosity_mod.prospective_guard_score(
+                self.index, body, admitted_seq)
+            if score is None:
+                continue
+            hits, misses = score
+            holdout = body.get("holdout") or {}
+            # Evidence in nats (gate.direction_evidence): the admission record's
+            # support for the direction vs the post-admission record's support
+            # for its INVERSE — both grow with sample size, so the §3.4
+            # hysteresis compares like with like.
+            admission = gate_mod.direction_evidence(
+                int(holdout.get("hits", 0)), int(holdout.get("misses", 0)))
+            against = gate_mod.direction_evidence(misses, hits)
+            reversal = gate_mod.demotion_warranted(admission, against)
+            stale = (hits <= misses
+                     and hits + misses >= gate_mod.STALE_AUDIT_FACTOR
+                     * curiosity_mod.MIN_AUDIT_OBS)
+            if not (reversal or stale):
+                continue
+            why = "direction reversed post-admission" if reversal else \
+                "stopped beating chance on twice the entry evidence"
+            payload = {
+                "target_kind": "rule",
+                "target_id": f"rule:{admitted_seq}",
+                "candidate_id": row["id"],
+                "scored": {"hits": hits, "misses": misses},
+                "reason": f"prospective audit: {why} "
+                          f"({hits} hits / {misses} misses)",
+            }
+            ev = self.ledger.append("demotion", "agent:curiosity", payload,
+                                    source_ref="curiosity:prospective-audit")
+            apply_mod.apply_event(self.index, ev, payload)
+            demoted.append({
+                "gate_run_id": None, "candidate_id": row["id"],
+                "candidate_kind": "guard", "status": "demoted",
+                "failing_step": None, "reason": payload["reason"],
+            })
+        if demoted:
+            self._closure = None
+        return demoted
 
     def _max_observation_seq(self) -> int:
         """Largest observation event_seq in the index (0 if none). The sweep's
@@ -828,6 +951,18 @@ class CandorSystem:
         ev = self.ledger.append("resolution", "verifier:harness", payload)
         apply_mod.apply_event(self.index, ev, payload)
         self.index.commit()
+        # Δ12: a conjecture claim that settled TRUE is a VALIDATED postulate —
+        # implement it by asserting the statement as an ordinary fact candidate
+        # through the gate (I10: through, never around). A false settlement
+        # implements nothing; either way the analogy engine's calibration curve
+        # was just scored above (I9, its own predictor class).
+        if (row["predictor_class"] == calibration_mod.CONJECTURE_PREDICTOR_CLASS
+                and bool(outcome)):
+            stmt = json.loads(row["stmt_json"])
+            self.assert_({"pred": stmt["pred"], "args": stmt["args"],
+                          "stmt_type": "crisp"},
+                         source=f"conjecture:{claim_id}",
+                         actor="agent:conjecture")
         return ev.seq
 
     def _resolve_categorical(self, row: Any, claim_id: str,
@@ -933,12 +1068,68 @@ class CandorSystem:
         return {r["id"] for r in self.index.query(
             "SELECT id FROM facts WHERE breadth_class='narrow'")}
 
-    def conjecture(self, goal: Mapping[str, Any],
-                   sim_budget: float) -> list[dict[str, Any]]:
+    def conjecture(self, goal: Mapping[str, Any], sim_budget: float,
+                   commit: bool = False,
+                   due: Optional[int] = None) -> list[dict[str, Any]]:
+        """Analogical conjectures for `goal` (§4.3, I4) — and, with `commit`,
+        the postulate→validate→implement loop over them (Δ12).
+
+        `commit=False` (the default) is the read-only path, byte-identical to
+        before: soft edges propose, nothing is appended, nothing moves.
+
+        `commit=True` files each conjecture as a CLAIM attributed to
+        `agent:conjecture`: predicted_p is the analog's own earned probability
+        (`predict(via).p` — the analogy TRANSFERS an audited number, similarity
+        is not a probability), under the distinct `conjecture/v1` predictor
+        class so the analogy engine's calibration curve never pools with the
+        WMC engine's (I9). Settling the claim (`resolve`) scores that curve —
+        the engine's track record is measured, not presumed — and a TRUE
+        settlement auto-asserts the goal as an ordinary fact candidate through
+        the gate (I10: never a fact directly). A conjecture with an unresolved
+        claim already on the books is not re-filed; it carries the existing
+        claim_id. Conjectures whose analog is categorical are proposed but not
+        committed (a distribution is not a transferable scalar).
+        """
         signatures = self._signatures()
         neighbours = conjecture_mod.neighbourhood(goal["pred"], signatures, sim_budget)
         known = {(p, a) for p, a in self.closure().atoms}
-        return conjecture_mod.conjectures(goal, neighbours, known)
+        out = conjecture_mod.conjectures(goal, neighbours, known)
+        if not commit:
+            return out
+        for c in out:
+            stmt = {"pred": c["goal"]["pred"], "args": list(c["goal"]["args"])}
+            stmt_json = canon_json(stmt)
+            existing = self.index.one(
+                "SELECT id FROM claims WHERE predictor_class=? AND stmt_json=? "
+                "AND resolved_ts IS NULL ORDER BY id LIMIT 1",
+                (calibration_mod.CONJECTURE_PREDICTOR_CLASS, stmt_json))
+            if existing is not None:
+                c["claim_id"] = existing["id"]
+                continue
+            via_pred = self.predict(c["via"], budget=10_000)
+            if not isinstance(via_pred, PredictOutcome):
+                continue                    # categorical analog: nothing to transfer
+            claim_id = f"claim:{self.ledger.seq() + 1}"
+            payload = {
+                "claim_id": claim_id, "stmt": stmt,
+                "frame": "internal", "settlement": "observation_pending",
+                "criterion": f"conjecture:{c['via']['pred']}",
+                "verifier_id": "verifier:observation(conjecture)",
+                "due": due, "certainty_class": "estimated",
+                "predicted_p": via_pred.p,
+                "ci_lo": via_pred.ci[0], "ci_hi": via_pred.ci[1],
+                "model_snapshot": via_pred.snapshot_id,
+                "predictor_class": calibration_mod.CONJECTURE_PREDICTOR_CLASS,
+                "sensitivity": {},
+                # audit trail: what licensed the transfer, and at what budget
+                "conjecture": {"via": c["via"], "sim": c["sim"],
+                               "caveats": c["caveats"]},
+            }
+            ev = self.ledger.append("claim", "agent:conjecture", payload)
+            apply_mod.apply_event(self.index, ev, payload)
+            c["claim_id"] = claim_id
+        self.index.commit()
+        return out
 
     def _signatures(self) -> dict[str, dict[str, float]]:
         firings: list[tuple[str, int, str]] = []
@@ -1065,6 +1256,8 @@ class CandorSystem:
         if post.total_observations == 0:
             # Admitted but never observed: the whole predictive mass is unknown.
             caveats.add("no_observations")
+        if self._regime_mixed(idx, fact_id):
+            caveats.add("regime_mixed")                # Δ13, as on the scalar path
 
         # C4 (design §3): surface the value distribution CONDITIONED on any key a
         # curiosity guard discovered conditions this fact on. Read the fact's own
@@ -1073,7 +1266,10 @@ class CandorSystem:
         # the key. Which keys to surface is driven by the SAME dispersion→guard
         # flow the binary path uses (§3), not new plumbing.
         obs = self._categorical_observations(idx, fact_id)
-        recorded_keys = {k for ctx, _ in obs for k in ctx}
+        # The under-specified caveat keys off what the AGENT recorded; the Δ10
+        # derived frames ride the same dicts but must not trip it.
+        recorded_keys = {k for ctx, _ in obs for k in ctx
+                         if not curiosity_stats_mod.is_derived(k)}
         cond_keys: list[str] = []
         seen_ck: set[str] = set()
         for r in idx.query(
@@ -1103,12 +1299,16 @@ class CandorSystem:
 
     def _categorical_observations(
             self, idx: Index, fact_id: str) -> list[tuple[dict[str, str], str]]:
-        """The fact's categorical observations as (recorded context, value) pairs.
-        Pure read over `observations`/`obs_context`, ORDER BY event_seq, so it
+        """The fact's categorical observations as (context, value) pairs, the
+        context augmented with the Δ10 derived frames (so a guard admitted on
+        `derived:*` breaks down here exactly like a recorded key). Pure read over
+        `observations`/`obs_context`/`events`, ORDER BY event_seq, so it
         reproduces under replay/predict_at (I3/I8)."""
         rows = idx.query(
-            "SELECT event_seq, value FROM observations "
-            "WHERE fact_id=? AND value IS NOT NULL ORDER BY event_seq", (fact_id,))
+            "SELECT o.event_seq AS event_seq, o.value AS value, e.ts AS ts "
+            "FROM observations o JOIN events e ON e.seq = o.event_seq "
+            "WHERE o.fact_id=? AND o.value IS NOT NULL ORDER BY o.event_seq",
+            (fact_id,))
         ctx_rows = idx.query(
             "SELECT oc.event_seq AS event_seq, oc.key AS key, oc.value AS value "
             "FROM obs_context oc JOIN observations o ON o.event_seq = oc.event_seq "
@@ -1116,7 +1316,11 @@ class CandorSystem:
         by_seq: dict[int, dict[str, str]] = {}
         for r in ctx_rows:
             by_seq.setdefault(int(r["event_seq"]), {})[r["key"]] = r["value"]
-        return [(by_seq.get(int(r["event_seq"]), {}), r["value"]) for r in rows]
+        base = [by_seq.get(int(r["event_seq"]), {}) for r in rows]
+        prevs: list = [None] + [rows[i - 1]["value"] for i in range(1, len(rows))]
+        aug = curiosity_stats_mod.augment_derived(
+            base, [int(r["ts"]) for r in rows], prevs)
+        return [(aug[i], r["value"]) for i, r in enumerate(rows)]
 
     def _categorical_context_breakdown(
             self, obs: list[tuple[dict[str, str], str]], key: str,
@@ -1201,10 +1405,36 @@ class CandorSystem:
             # function of the votes, so predict_at reproduces it (I8).
             if states[target].votes and predict_mod.is_flaky(states[target].votes):
                 caveats.add("unstable")
+            # Δ13: this scalar pools observations from more than one
+            # intervention regime — P(·|observe) and P(·|do) are different
+            # quantities and the marginal is an average over the boundary. The
+            # per-regime numbers live in distribution(). Pure read (I8).
+            if self._regime_mixed(idx, target):
+                caveats.add("regime_mixed")
         if any(v >= 2 for v in sources.values()) and len(needed) >= 2:
             caveats.add("shared_provenance")
         return predict_mod.Problem(fid, dnf, states, groups, caveats, confusion,
                                    response_lr, self._actor_discounts(idx))
+
+    def _regime_mixed(self, idx: Index, fact_id: str) -> bool:
+        """Δ13: does this fact's observation set span more than one intervention
+        regime? True when any `do:` context key carries two or more distinct
+        values, or is recorded on some observations but not all (absent IS a
+        regime: nobody was intervening). Deterministic read over the index."""
+        total_row = idx.one(
+            "SELECT COUNT(*) AS n FROM observations WHERE fact_id=?", (fact_id,))
+        total = int(total_row["n"]) if total_row else 0
+        if total == 0:
+            return False
+        for r in idx.query(
+                "SELECT oc.key AS key, COUNT(DISTINCT oc.value) AS nv, "
+                "COUNT(*) AS n FROM obs_context oc "
+                "JOIN observations o ON o.event_seq = oc.event_seq "
+                "WHERE o.fact_id=? AND oc.key LIKE 'do:%' GROUP BY oc.key",
+                (fact_id,)):
+            if int(r["nv"]) >= 2 or int(r["n"]) < total:
+                return True
+        return False
 
     def _fact_state(self, idx: Index, fact_id: str) -> predict_mod.FactState:
         row = idx.one("SELECT stmt_type, dispersion_flag, breadth_class FROM facts "
@@ -1358,6 +1588,9 @@ class CandorSystem:
                   "__residual__": {"p": .., "n": ..}  # obs that did NOT record <key>
                 }, ...
               },
+              "derived_modes": {          # Δ10 — same shape, per SYNTHESIZED frame
+                "derived:hour": {...}, "derived:prev": {...}, ...
+              },
               "residual": {               # PART 2 — the unexplained "unknown" share
                 "conditioning_key": <key> | None,  # the admitted guard's variable, if any
                 "explained": float,       # η² of the guard partition; 0 with no guard
@@ -1379,9 +1612,10 @@ class CandorSystem:
         if fid is None:
             return {"found": False, "fact_id": None, "stmt_type": None,
                     "n_obs": 0, "flaky": False, "dispersion_flag": False,
-                    "modes": {}, "residual": {"conditioning_key": None,
-                                              "explained": 0.0, "unexplained": 0.0,
-                                              "dispersion_stat": None}}
+                    "modes": {}, "derived_modes": {},
+                    "residual": {"conditioning_key": None,
+                                 "explained": 0.0, "unexplained": 0.0,
+                                 "dispersion_stat": None}}
         row = self.index.one(
             "SELECT stmt_type, dispersion_flag FROM facts WHERE id=?", (fid,))
         stmt_type = row["stmt_type"]
@@ -1405,13 +1639,36 @@ class CandorSystem:
         obs = [(by_seq.get(int(r["event_seq"]), {}), bool(r["outcome"]))
                for r in rows]
 
-        # PART 1 — per-context-key breakdown, via the reusable helper.
+        # PART 1 — per-context-key breakdown, via the reusable helper. `modes`
+        # covers RECORDED context only, keeping the docstring's promise; the
+        # synthesized frames get their own section below.
         keys = sorted({k for ctx, _ in obs for k in ctx})
         modes: dict[str, Any] = {}
         for key in keys:
             groups = curiosity_stats_mod.outcome_breakdown(obs, key)
             modes[key] = {v: {"p": g.k / g.n, "n": g.n}
                           for v, g in sorted(groups.items())}
+
+        # Δ10 — derived frames, chronological (prev/hour need event order, not
+        # vote order): the same pure augmentation the sweep searches over, so a
+        # guard the sweep admitted on `derived:*` is inspectable here too.
+        crows = self.index.query(
+            f"SELECT o.event_seq, o.outcome, e.ts FROM observations o "
+            f"JOIN events e ON e.seq = o.event_seq "
+            f"WHERE o.fact_id IN ({placeholders}) ORDER BY o.event_seq", ids)
+        cbase = [by_seq.get(int(r["event_seq"]), {}) for r in crows]
+        prevs: list = [None] + ["T" if bool(crows[i - 1]["outcome"]) else "F"
+                                for i in range(1, len(crows))]
+        caug = curiosity_stats_mod.augment_derived(
+            cbase, [int(r["ts"]) for r in crows], prevs)
+        derived_obs = [(caug[i], bool(r["outcome"])) for i, r in enumerate(crows)]
+        derived_keys = sorted({k for ctx, _ in derived_obs for k in ctx
+                               if curiosity_stats_mod.is_derived(k)})
+        derived_modes: dict[str, Any] = {}
+        for key in derived_keys:
+            groups = curiosity_stats_mod.outcome_breakdown(derived_obs, key)
+            derived_modes[key] = {v: {"p": g.k / g.n, "n": g.n}
+                                  for v, g in sorted(groups.items())}
 
         # A crisp fact whose votes alternate is flaky even when the sweep's
         # overdispersion test stays silent (H8b) — the same signal predict()
@@ -1433,10 +1690,16 @@ class CandorSystem:
             if body.get("target_fact") in ids:
                 cond_key = body.get("conditioning_key")   # most recent match wins
         explained = 0.0
-        if cond_key is not None and cond_key in keys:
-            value_groups = [g for _, g in sorted(
-                curiosity_stats_mod.partition_by_key(obs, cond_key).items())]
-            explained = curiosity_stats_mod.explained_fraction(value_groups)
+        if cond_key is not None:
+            # A derived conditioning key (Δ10) lives on the augmented projection;
+            # a recorded one on the raw observations. Either way η² is the same
+            # deterministic decomposition.
+            src = obs if cond_key in keys else (
+                derived_obs if cond_key in derived_keys else None)
+            if src is not None:
+                value_groups = [g for _, g in sorted(
+                    curiosity_stats_mod.partition_by_key(src, cond_key).items())]
+                explained = curiosity_stats_mod.explained_fraction(value_groups)
         unexplained = (1.0 - explained) if dispersed else 0.0
         oq = self.index.one(
             "SELECT dispersion_stat FROM open_questions "
@@ -1447,6 +1710,7 @@ class CandorSystem:
             "found": True, "fact_id": fid, "stmt_type": stmt_type,
             "n_obs": len(rows), "flaky": dispersed,
             "dispersion_flag": dispersion_flag, "modes": modes,
+            "derived_modes": derived_modes,
             "residual": {"conditioning_key": cond_key, "explained": explained,
                          "unexplained": unexplained,
                          "dispersion_stat": dispersion_stat},
