@@ -13,7 +13,7 @@ import json
 import shutil
 import tempfile
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
@@ -81,12 +81,21 @@ class CategoricalPrediction:
 
     `values` maps each seen value to its {p, ci} slice in canonical order
     (ORDER BY value); `unknown` is the never-seen mass with its own interval.
-    `Σ values[*].p + unknown.p == 1.0` exactly by construction (§2.1)."""
+    `Σ values[*].p + unknown.p == 1.0` exactly by construction (§2.1).
+
+    `by_context` (C4, design §3) is the value distribution CONDITIONED on a
+    discovered conditioning key: ``{key: {context_value: {"values": {...},
+    "unknown": slice, "n": int}}}``. Each context group carries its OWN CRP
+    predictive with its own unknown slice, plus a ``__residual__`` group for
+    observations that did not record the key — the honest "cannot attribute" mass
+    kept distinct from the per-context unknown slices. Empty unless the curiosity
+    sweep admitted a guard conditioning this fact on a key (§7)."""
     values: dict[str, counts_mod.CategoricalSlice]
     unknown: counts_mod.CategoricalSlice
     total_observations: int
     snapshot_id: str
     caveats: frozenset[str]
+    by_context: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
 
 
 class CandorSystem:
@@ -989,9 +998,86 @@ class CandorSystem:
         if post.total_observations == 0:
             # Admitted but never observed: the whole predictive mass is unknown.
             caveats.add("no_observations")
+
+        # C4 (design §3): surface the value distribution CONDITIONED on any key a
+        # curiosity guard discovered conditions this fact on. Read the fact's own
+        # observations + recorded context and run the §2 CRP predictive per context
+        # group (its own unknown slice) plus a __residual__ group for obs missing
+        # the key. Which keys to surface is driven by the SAME dispersion→guard
+        # flow the binary path uses (§3), not new plumbing.
+        obs = self._categorical_observations(idx, fact_id)
+        recorded_keys = {k for ctx, _ in obs for k in ctx}
+        cond_keys: list[str] = []
+        seen_ck: set[str] = set()
+        for r in idx.query(
+                "SELECT body_json FROM candidates WHERE kind='guard' "
+                "AND status='admitted' ORDER BY event_seq"):
+            body = json.loads(r["body_json"])
+            if body.get("target_fact") != fact_id:
+                continue
+            ck = body.get("conditioning_key")
+            if ck is not None and ck not in seen_ck:
+                seen_ck.add(ck)
+                cond_keys.append(ck)
+        by_context: dict[str, dict[str, dict[str, Any]]] = {}
+        for key in cond_keys:
+            if any(key in ctx for ctx, _ in obs):
+                by_context[key] = self._categorical_context_breakdown(
+                    obs, key, counts_mod.CATEGORICAL_ALPHA)
+        # Recorded context but nothing yet conditions on it — the marginal is
+        # honest but under-specified (§3), the categorical analog of the binary
+        # `unstable`/narrow-breadth caveats.
+        if recorded_keys and not by_context:
+            caveats.add("under_specified")
+
         return CategoricalPrediction(post.values, post.unknown,
                                      post.total_observations, snapshot,
-                                     frozenset(caveats))
+                                     frozenset(caveats), by_context)
+
+    def _categorical_observations(
+            self, idx: Index, fact_id: str) -> list[tuple[dict[str, str], str]]:
+        """The fact's categorical observations as (recorded context, value) pairs.
+        Pure read over `observations`/`obs_context`, ORDER BY event_seq, so it
+        reproduces under replay/predict_at (I3/I8)."""
+        rows = idx.query(
+            "SELECT event_seq, value FROM observations "
+            "WHERE fact_id=? AND value IS NOT NULL ORDER BY event_seq", (fact_id,))
+        ctx_rows = idx.query(
+            "SELECT oc.event_seq AS event_seq, oc.key AS key, oc.value AS value "
+            "FROM obs_context oc JOIN observations o ON o.event_seq = oc.event_seq "
+            "WHERE o.fact_id=?", (fact_id,))
+        by_seq: dict[int, dict[str, str]] = {}
+        for r in ctx_rows:
+            by_seq.setdefault(int(r["event_seq"]), {})[r["key"]] = r["value"]
+        return [(by_seq.get(int(r["event_seq"]), {}), r["value"]) for r in rows]
+
+    def _categorical_context_breakdown(
+            self, obs: list[tuple[dict[str, str], str]], key: str,
+            alpha: float) -> dict[str, dict[str, Any]]:
+        """Per-context-value CRP predictive for ONE conditioning key (design §3).
+
+        Reuses Feature A's `outcome_breakdown` (each fact-value projected
+        one-vs-rest, so the residual bucket + integer tallies are the SAME helper
+        the binary `distribution()` uses) to build per-context per-value counts,
+        then runs the §2 CRP predictive INDEPENDENTLY per context group via the
+        shared `counts.category_group_posterior` kernel. Deterministic: context
+        groups in canonical order (`__residual__` last), values ORDER BY value."""
+        values = sorted({v for _, v in obs})
+        totals: dict[str, int] = {}
+        per_value: dict[str, dict[str, int]] = {}
+        for v in values:
+            proj = [(ctx, ov == v) for ctx, ov in obs]
+            for cv, g in curiosity_stats_mod.outcome_breakdown(proj, key).items():
+                totals[cv] = g.n
+                per_value.setdefault(cv, {})[v] = g.k
+        out: dict[str, dict[str, Any]] = {}
+        for cv in sorted(totals,
+                         key=lambda c: (c == curiosity_stats_mod.RESIDUAL_BUCKET, c)):
+            post = counts_mod.category_group_posterior(
+                per_value.get(cv, {}), totals[cv], alpha)
+            out[cv] = {"values": post.values, "unknown": post.unknown,
+                       "n": totals[cv]}
+        return out
 
     def _build_problem(self, idx: Index, clo: closure_mod.Closure, pred: str,
                        args: list[Any]) -> predict_mod.Problem:

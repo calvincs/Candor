@@ -228,6 +228,44 @@ def category_posterior(idx: "Index", fact_id: str,
     return CategoricalPosterior(values, unknown, raw_total)
 
 
+def category_group_posterior(per_value_counts: dict[str, int], total_n: int,
+                             alpha: float = CATEGORICAL_ALPHA) -> CategoricalPosterior:
+    """CRP predictive for ONE context group (categorical C4, design §3).
+
+    The §2 CRP formula run over a single context group's RAW per-value tallies —
+    the read-time numerics of `category_posterior` factored out so the marginal
+    and every per-context conditional share one deterministic kernel. Each group
+    gets its OWN unknown slice: a rarely-seen context is itself mostly-unknown,
+    which is correct (§3). Values iterate in a fixed canonical order (ORDER BY
+    value); the unknown mass is carried as the residual 1 − Σ P(v) so the vector
+    sums to exactly 1 under the same left-to-right summation (§2.1), and it is a
+    pure function of the integer counts, so it reproduces bit-for-bit (I3/I8).
+
+    Unlike the marginal this view is UN-discounted (raw observation counts, not
+    the C3 per-(actor,value) reliability weight): the conditional breakdown answers
+    "given context c, what did this fact actually do," an honest per-group tally.
+    """
+    denom = float(total_n) + alpha
+    values: dict[str, CategoricalSlice] = {}
+    seen_mass = 0.0
+    for value in sorted(per_value_counts):
+        n = int(per_value_counts[value])
+        if n <= 0:
+            continue
+        p = n / denom
+        seen_mass += p
+        lo = betaincinv(float(n), denom - n, CAT_CI_LO)
+        hi = betaincinv(float(n), denom - n, CAT_CI_HI)
+        values[value] = CategoricalSlice(p, (lo, hi))
+    if total_n <= 0:
+        unknown = CategoricalSlice(1.0, (1.0, 1.0))
+    else:
+        lo = betaincinv(alpha, float(total_n), CAT_CI_LO)
+        hi = betaincinv(alpha, float(total_n), CAT_CI_HI)
+        unknown = CategoricalSlice(1.0 - seen_mass, (lo, hi))
+    return CategoricalPosterior(values, unknown, total_n)
+
+
 def apply_rule_observation(idx: "Index", rule_id: str, actor: str,
                            outcome: bool) -> None:
     idx.execute(
