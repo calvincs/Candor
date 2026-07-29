@@ -43,11 +43,14 @@ the latest observations after a `run_gate()` or a reopen; call it before
 comparing closure hashes across processes (see
 [architecture.md](architecture.md#the-curiosity-engine-stage-5)).
 
-### `observe(stmt, outcome, ctx, actor, confidence=None) -> event_seq`
+### `observe(stmt, outcome=None, ctx, actor, value=None, confidence=None) -> event_seq`
 An attributed outcome report. `ctx` is free-form key/value ambient state —
 **log wide**; it's the raw material for finding missing variables later.
 `confidence` (0..1) grades the vote; the API bins it to an integer grade and
-keeps the raw value in the event payload. `observe_batch([...])` for bulk.
+keeps the raw value in the event payload. For a **categorical** fact, pass
+`value="captcha"` (the realised category) instead of `outcome` — which field is
+authoritative is decided at fold time by the fact's `stmt_type`. `observe_batch([...])`
+for bulk.
 
 ### `claim(stmt, frame, criterion, due) -> claim_id | "Refused"`
 Registers a prediction to be settled. `frame` is `internal`/`external`;
@@ -55,10 +58,13 @@ Registers a prediction to be settled. `frame` is `internal`/`external`;
 external verifiers). A claim with no constructible verifier is **refused** —
 unsettleable statements stay prose.
 
-### `resolve(claim_id, outcome, ...) -> event_seq`
+### `resolve(claim_id, outcome=None, value=None, ...) -> event_seq`
 Settles a claim. This is the **only** path that moves trust: every prior
 observation on the statement is scored against the settled outcome, updating
-each actor's confusion and response ledgers.
+each actor's confusion and response ledgers. For a categorical claim, pass the
+realised `value`; its surprisal is `-log P_frozen(value)`, which stays **finite
+even for a value never seen before** (it scores against the frozen unknown mass)
+— trust moves per source via a one-vs-rest reduction.
 
 ### `pin(target_id, polarity, reason, authority)` / `supersede(target_id, reason)`
 A `-` pin is the system's only hard zero (contradicting observations are
@@ -94,9 +100,32 @@ re-checked.
 ### `predict(stmt, budget) -> PredictOutcome`
 `p`, `ci`, `channels` (epistemic vs aleatoric spread), `sensitivity` (which
 fact flips the conclusion), `mpe`, `caveats` (e.g. `shared_provenance`,
-`narrow_breadth`), `rejection_rate` (constraint tension), and `snapshot_id`.
-`predict_at(stmt, snapshot_id)` re-runs at a recorded ledger position and
-reproduces the number exactly.
+`narrow_breadth`, `unstable` for a flaky fact), `rejection_rate` (constraint
+tension), and `snapshot_id`. `predict_at(stmt, snapshot_id)` re-runs at a
+recorded ledger position and reproduces the number exactly.
+
+### `predict` on a categorical fact -> `CategoricalPrediction`
+When `stmt` names a categorical fact, `predict` returns a **distribution**, not a
+scalar: `values` (`{value: slice}` in canonical order, each slice a point `p`
+with a `ci`), `unknown` (the never-seen mass as its own slice), `total_observations`,
+`snapshot_id`, `caveats`, and `by_context` (the value distribution conditioned on
+a discovered guard key — each context group carrying its own unknown slice plus a
+`__residual__` group for observations that didn't record the key). `Σ values[*].p
++ unknown.p == 1.0` exactly. The unknown mass is a Dirichlet-process / CRP
+predictive `alpha/(N+alpha)`: thin data reserves more unknown, and it shrinks as
+observations accumulate. `predict_at` reproduces the full distribution
+bit-for-bit and `alpha` rides the snapshot id (see the
+[v0.5 delta](spec-v0.5-delta.md)).
+
+### `distribution(stmt) -> dict`
+A pure read-time breakdown of a flaky **binary** (crisp/frequency) fact — it
+writes nothing, moves no count, changes no `closure_hash`, and never runs
+`predict`. `modes` splits the true-rate by each recorded context key (with a
+`__residual__` bucket for observations that didn't record it); `residual` reports
+how much of the spread an admitted guard **explains** (`explained` = the η²
+correlation ratio of its partition) versus the honest `unexplained` remainder.
+It is the companion to the `unstable` caveat: not just *that* a fact is flaky,
+but *how* it splits by context and how much no recorded variable accounts for.
 
 ### `derive(goal, budget) -> DeriveOutcome`
 Three-valued, honestly: `proof` (with a kernel-checked derivation and a

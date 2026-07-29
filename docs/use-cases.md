@@ -77,6 +77,38 @@ plausible-looking rules that failed held-out validation. See
 **Fits:** scraper/API health, CI flakiness forensics, feed-quality
 monitoring, any place "it used to work" is a bug report.
 
+## 4. Open-vocabulary outcomes: "which one happened — could it be one we've never seen?"
+
+**The problem.** The outcome isn't true/false and isn't a fixed enum: a login
+flow resolves to a captcha, a block page, an MFA challenge — or something new
+next week. Bucketing into success/failure throws away *which* failure, and a
+fixed enum can't represent a value you haven't met yet, so a brand-new failure
+mode reads as probability zero instead of "unknown."
+
+**The CANDOR shape.** Declare the fact `categorical` and observe values; the
+vocabulary grows as you go, and `predict()` returns a distribution with a
+first-class unknown mass:
+
+```python
+m.assert_({"pred": "resolves", "args": ["login"], "stmt_type": "categorical"},
+          source="runbook", actor="human:me")
+m.run_gate()
+for v in ["captcha"] * 8 + ["block"] * 2:
+    m.observe({"pred": "resolves", "args": ["login"]}, ctx={"region": "eu"},
+              actor="tool:probe", value=v)
+p = m.predict({"pred": "resolves", "args": ["login"]}, budget=1000)
+# p.values["captcha"].p == 8/11 ≈ 0.73, p.values["block"].p == 2/11 ≈ 0.18,
+# p.unknown.p == 1/11 ≈ 0.09  — a never-seen value keeps a real probability.
+```
+
+A value you have never observed keeps a real probability (`p.unknown`);
+settlement scores surprisal against it (finite even for a first-ever value); and
+the curiosity sweep conditions the distribution on context (`p.by_context`) just
+as it guards binary facts. See `examples/categorical.py`.
+
+**Fits:** failure-mode classification, error-class and routing distributions,
+intent/label tracking where the label set is not closed.
+
 ## Anti-use-cases (read before adopting)
 
 - **Not a vector database.** The optional dense ranker helps `recall`, but if
@@ -87,5 +119,6 @@ monitoring, any place "it used to work" is a bug report.
   per-source learning, and ~free reads — not beating a fresh reader.
 - **Not distributed.** Single writer, single sequencer, one box. By design,
   for v1.
-- **Binary outcomes only** in v1 — scalar outcomes (latencies, scores) need
-  binarizing at the boundary.
+- **No native continuous channel.** Outcomes are binary (crisp/frequency) or
+  open-vocabulary categorical (use case 4); *continuous* scalars (latencies,
+  scores) still need binarizing or bucketing at the boundary.

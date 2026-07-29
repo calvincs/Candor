@@ -555,3 +555,39 @@ class TestProvenance:
                     < abs(float(before[i]) - float(expected[i])) for i in range(12))
         assert moved >= 10, (
             f"discounting moved only {moved}/12 beliefs toward the clean value")
+
+
+def test_categorical_reserves_earned_unknown_mass_for_unseen_values():
+    """README: 'a value we've never seen ... a real possibility with its own
+    probability, not a rounding error'; docs/spec-v0.5-delta.md. The reserved
+    unknown mass is EARNED, not a fixed fudge: large while the vocabulary is
+    still being discovered, shrinking toward zero as evidence piles up (the null
+    control), and the open vocabulary genuinely admits a brand-new value with
+    real probability and no schema change."""
+    stmt = {"pred": "resolves", "args": ["login"]}
+    m = W.fresh_store("candor-cat-", actors=["tool:probe"])
+    m.assert_({**stmt, "stmt_type": "categorical"}, source="ops", actor="human:me")
+    m.run_gate()
+
+    # Still-discovering fact: 8 captcha + 2 block, N=10, alpha=1 -> unknown = 1/11.
+    for v in ["captcha"] * 8 + ["block"] * 2:
+        m.observe(stmt, ctx={}, actor="tool:probe", value=v)
+    thin = m.predict(stmt, budget=1000)
+    total = sum(s.p for s in thin.values.values()) + thin.unknown.p
+    assert total == pytest.approx(1.0), "categorical distribution must sum to 1"
+    assert thin.unknown.p > 0.05, "a still-discovering fact must reserve real unknown mass"
+
+    # Null control: heavily confirm the SAME fact; the unknown mass must shrink
+    # (it is a function of the evidence, not a constant).
+    for _ in range(200):
+        m.observe(stmt, ctx={}, actor="tool:probe", value="captcha")
+    thick = m.predict(stmt, budget=1000)
+    assert thick.unknown.p < thin.unknown.p / 10, "unknown mass did not shrink with evidence"
+
+    # The reserved mass was right to exist: a brand-new value appears with real
+    # probability and no schema change (open vocabulary).
+    m.observe(stmt, ctx={}, actor="tool:probe", value="mfa_challenge")
+    caught = m.predict(stmt, budget=1000)
+    m.close()
+    assert "mfa_challenge" in caught.values and caught.values["mfa_challenge"].p > 0, (
+        "a never-before-seen value did not enter the distribution")

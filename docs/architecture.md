@@ -71,6 +71,13 @@ Every fact carries a `stmt_type` that decides what an observation means:
 - **frequency** — "X happens at some rate": observations are trials and move
   the *aleatoric* channel (the rate); belief in the reference class itself
   moves only through structural events.
+- **categorical** (v0.5) — "X takes one of an open set of values": each
+  observation records a *value*, the vocabulary grows as new values appear, and
+  the read-time predictive is a distribution over the seen values plus a
+  first-class *unknown* mass (Dirichlet-process / CRP, `alpha/(N+alpha)`). It is
+  neither channel — it is a distribution — and it composes with the same
+  curiosity and settlement machinery via a per-value one-vs-rest reduction. See
+  [spec-v0.5-delta.md](spec-v0.5-delta.md).
 
 Orthogonally, a fact has `structural` status (candidate/admitted/pinned),
 `numeric` status (accumulating/frozen), and an admission `kind`
@@ -146,7 +153,9 @@ comparing closure hashes across processes.
 
 `SPEC.md` is the frozen v0.2 spec. [spec-v0.3-delta.md](spec-v0.3-delta.md)
 (two-coin trust, context-grouped composition, permanent control, dense
-retrieval as periphery input) and [spec-v0.4-delta.md](spec-v0.4-delta.md)
-(graded observations, witness floor) were adopted after pre-registered test
-rounds; each delta cites the evidence that forced it. `DEVIATIONS.md` records
-every interpretive decision.
+retrieval as periphery input), [spec-v0.4-delta.md](spec-v0.4-delta.md)
+(graded observations, witness floor), and [spec-v0.5-delta.md](spec-v0.5-delta.md)
+(open-vocabulary categorical facts with a first-class unknown mass, read-time
+distribution surfacing) were adopted after pre-registered test rounds; each delta
+cites the evidence that forced it. `DEVIATIONS.md` records every interpretive
+decision.

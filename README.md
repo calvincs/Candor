@@ -23,6 +23,12 @@ lab notebook:
   hunts the missing variable, and proposes *conditions* ("works **when**
   method=crawl4ai"). When something changes for good, it finds the date:
   regime changes are located, not decayed away.
+- **It knows what it hasn't seen.** Beyond true/false, a fact can record an
+  *open-vocabulary* categorical outcome (which of many values happened), and the
+  vocabulary grows as new values appear. The distribution carries a first-class
+  *unknown* mass — "captcha 73%, block 18%, and 9% a value we've never seen" —
+  so an unfamiliar outcome is a real possibility with its own probability, not a
+  rounding error.
 - **Nothing is ever silently mutated.** Change is append + recompute. Delete
   the SQLite index entirely and rebuild it bit-for-bit from the log. Retract a
   poisoned source and every downstream number recomputes as if it never spoke.
@@ -74,7 +80,7 @@ print(p.p, p.ci, p.snapshot_id)   # a real probability, reproducible from its sn
 | `src/candor/core/` | Trusted core: ledger, gate, closure, counts, calibration (stdlib-only) |
 | `src/candor/periphery/` | Untrusted periphery: retrieval, prediction, extraction, curiosity |
 | `tests/conformance.py` | The executable spec — 23 conformance tests across 5 stage gates |
-| `tests/unit/` | 194 additive tests |
+| `tests/unit/` | 443 additive tests |
 | `tests/claims/` | The executable README — every claim on this page, measured on synthetic worlds with planted truth and null controls (`make claims`) |
 | `bench/` | The pre-registered honest-test harness and its findings |
 | `DEVIATIONS.md` | Every place the build interprets, extends, or argues with the spec |
@@ -98,12 +104,15 @@ failures and what each one taught, is in [docs/benchmarks.md](docs/benchmarks.md
 - **[API guide](docs/api.md)** — every call with examples
 - **[Use cases](docs/use-cases.md)** — agent memory, source-reliability tracking, drift detection
 - **[Benchmarks](docs/benchmarks.md)** — the pre-registered 6.8 rounds, honestly told
+- **[Security model](SECURITY.md)** — the trust boundary, opt-in access control, and what the hash chain does and doesn't prove
 
 ## Status
 
-Fully conformant against the spec through Stage 5 (all gates green: 216 tests
-+ 1 xfail-by-design), plus 34 claims tests holding this page to its word. Spec
-v0.2 plus adopted deltas v0.3/v0.4. Single-writer, single-box by design —
+Fully conformant against the spec through Stage 5 (23 conformance gates green),
+backed by 443 additive unit tests (1 xfail-by-design) and 35 claims tests
+holding this page to its word. Spec v0.2 plus adopted deltas v0.3 / v0.4 / v0.5
+(v0.5 adds open-vocabulary categorical facts with a first-class unknown mass and
+read-time distribution surfacing). Single-writer, single-box by design —
 distributed consensus is an explicit non-goal for v1.
 
 Six defects have been found by the claims suite and fixed, each recorded with

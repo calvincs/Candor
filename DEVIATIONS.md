@@ -402,3 +402,54 @@ the scales tried; it needs no covariate because the variance is visible in the
 series itself. The routing speaks on either ground, and for the temporal case
 the residual partition *is* the time blocks.
 Evidence: `bench/CLAIMS_HARDENING.md` Stage 6.
+
+### D25 — v0.5 delta adopted: open-vocabulary categorical facts + distribution surfacing
+A third `stmt_type`, `categorical`, whose observations record a *value* over an
+open (growing) vocabulary, plus a read-time `distribution()` X-ray for flaky
+binary facts. Decisions locked before the build:
+
+- **Unknown mass is Dirichlet-process / CRP with the Pitman–Yor discount pinned
+  to `d = 0`.** `P(unknown) = alpha/(N+alpha)` is a function of `N` alone; making
+  novelty depend on the distinct-value count is the deferred `d > 0` upgrade. A
+  single pre-registered global `alpha = 1.0` is versioned into the predictor
+  class `categorical/v1` and rides the snapshot id (I8); the categorical path
+  calibrates under its own predictor class, never pooled with the scalar path
+  (I9). Per-value intervals are the Beta marginals of the Dirichlet, reusing
+  `betamath` verbatim.
+- **Per-source trust is a one-vs-rest reduction** over the existing two-coin
+  confusion machinery (virtual actor id `catv1:<canon_json([actor, value])>`),
+  not a full Dawid–Skene value→value confusion matrix (deferred).
+- **Leaf-query only in v1**, one global `alpha`. Joint-multinomial guard tests
+  and per-value changepoints are deferred.
+- **Strictly additive.** The only schema tightening that widens is the
+  `facts.stmt_type` CHECK; a crisp/frequency prediction is byte-identical whether
+  or not categorical data shares the store. `fact_category_counts` and the
+  nullable `observations.value` fold on the same path and enter `COUNT_COLUMNS`
+  (I11) and `_HASH_QUERIES`.
+
+Evidence: `docs/spec-v0.5-delta.md`; `tests/unit/test_categorical_c1.py`..`c4.py`,
+`tests/unit/test_distribution_surfacing.py`.
+
+### D26 — quotas are per-epoch, with the epoch derived from the event timestamp
+§3.12's `obs_quota_per_epoch` was enforced with `epoch` pinned to 0 everywhere —
+a lifetime cap that never reset. The epoch is now `apply.epoch_of(ts) =
+ts // QUOTA_EPOCH_MS` (one day); observe()/assert_() fix the event ts up front so
+the boundary check and the fold-time bump agree on the bucket. Quotas remain
+deployment configuration outside the closure hash (`quota_usage` is absent from
+`_HASH_QUERIES`), so this moves no replay number, and replay reproduces every
+bucket because the ts is in the ledger. A live burst (default wall-clock ts)
+stays inside one epoch, so the flooding bound is unchanged.
+Evidence: `tests/unit/test_quota_epoch_m2.py`.
+
+### D27 — authorization is opt-in; attribution labels are advisory by default
+`actor`/`authority`/`source` are attribution labels, not authenticated
+identities — CANDOR's trust boundary is the process. `set_authz(policy)`
+installs a `(principal, op) -> bool` gate consulted before the privileged writes
+(pin, redact, retract_source, register_oracle, set_reliability), raising
+`Unauthorized` before any ledger append. The policy is runtime configuration: it
+never enters the closure hash and replay never re-checks it (every event already
+in the chain was admitted under whatever policy was active when written).
+Relatedly, the hash chain is a *consistency* mechanism, not tamper-evidence — a
+writer who can edit a segment can recompute it — so tamper-evidence against that
+threat is left to an external anchor of `ledger_head()`.
+Evidence: `SECURITY.md`; `tests/unit/test_authz_m3.py`.

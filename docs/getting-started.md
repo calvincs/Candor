@@ -8,8 +8,8 @@ are needed only to run the test suite.
 ```sh
 make venv          # creates .venv and installs the test deps
 make gates         # stage1..stage5 conformance gates — should all be green
-make unit          # 194 additive unit tests
-make claims        # 34 claims tests: the README, measured on synthetic worlds
+make unit          # 443 additive unit tests
+make claims        # 35 claims tests: the README, measured on synthetic worlds
 ```
 
 `make claims-fast` skips the prediction-heavy tests (~45s instead of ~2m30s),
@@ -21,8 +21,10 @@ package) — there is nothing to compile and nothing to download.
 
 ## The mental model in five sentences
 
-1. A **fact** is a statement like `fetch_ok(rrstar.com)` — either *crisp*
-   ("this is true or it isn't") or *frequency* ("this succeeds at some rate").
+1. A **fact** is a statement like `fetch_ok(rrstar.com)` — *crisp* ("this is
+   true or it isn't"), *frequency* ("this succeeds at some rate"), or
+   *categorical* ("which of an open-ended set of values happened", with a
+   first-class *unknown* mass for values not yet seen).
 2. Nothing becomes a fact by assertion alone: assertions become **candidates**,
    and a seven-step **gate** (schema check, unit canonicalization, sandbox,
    pin veto, held-out check, MDL, contradiction check) decides admission.
@@ -69,9 +71,10 @@ print(m.why(m.fact_id_for({"pred": "deploy_ok", "args": ["api"]})))
 m.close()
 ```
 
-Run `examples/quickstart.py` for this loop end to end, and
+Run `examples/quickstart.py` for this loop end to end,
 `examples/source_reliability.py` / `examples/regime_change.py` for the two
-signature behaviours.
+signature behaviours, and `examples/categorical.py` for open-vocabulary
+categorical facts with a first-class unknown mass.
 
 ## Things that will surprise you (on purpose)
 
@@ -96,4 +99,11 @@ signature behaviours.
   `redaction_scope()` before firing it.
 - **Quotas are on by default.** An actor that floods observations or spams the
   gate hits its per-epoch quota and gets a `QuotaExceeded` — provision with
-  `set_actor_quota()` for legitimate bulk loads.
+  `set_actor_quota()` for legitimate bulk loads. The quota rolls over each epoch,
+  so a well-behaved actor is never permanently locked out.
+- **`authority` is a label, not a login.** By default the `actor`/`authority` on
+  a write is attribution, not an authenticated identity — CANDOR's trust
+  boundary is the process. If you need access control, register a policy with
+  `set_authz(...)` and the privileged writes (pin, redact, retract_source,
+  register_oracle, set_reliability) are enforced, raising `Unauthorized` before
+  anything is appended. See [SECURITY.md](../SECURITY.md).
