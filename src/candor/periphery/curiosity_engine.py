@@ -154,8 +154,17 @@ def _sweep_fact(idx, fact) -> list[tuple[str, dict[str, Any]]]:
         by_seq: dict[int, dict[str, str]] = {}
         for r in ctx_rows:
             by_seq.setdefault(int(r["event_seq"]), {})[r["key"]] = r["value"]
-        obs = [(by_seq.get(int(r["event_seq"]), {}), bool(r["outcome"]))
-               for r in rows]
+        # Δ10: the covariate search runs over the RECORDED context augmented with
+        # synthesized frames (hour/dow from the event ts, the fact's own previous
+        # outcome, pairwise interactions of recorded keys). A pure per-fact
+        # function of the log, so resweep purity and replay hold. `base_ctx` (the
+        # recorded truth) is kept for breadth, which measures the AGENT's logging
+        # diversity — a synthesized hour must never inflate it.
+        base_ctx = [by_seq.get(int(r["event_seq"]), {}) for r in rows]
+        prevs: list = [None] + ["T" if bool(rows[i - 1]["outcome"]) else "F"
+                                for i in range(1, len(rows))]
+        aug = C.augment_derived(base_ctx, [int(r["ts"]) for r in rows], prevs)
+        obs = [(aug[i], bool(r["outcome"])) for i, r in enumerate(rows)]
         keys = sorted({k for ctx, _ in obs for k in ctx})
 
         # §3.4 step 5: a GENUINE discovery/validation split. Every discovery
@@ -192,25 +201,44 @@ def _sweep_fact(idx, fact) -> list[tuple[str, dict[str, Any]]]:
             guardable = len(groups) <= max(
                 2, len(disc_obs) // (2 * C.MIN_SUPPORT_PER_PARTITION))
             tested.append((key, usable, pvalue, guardable))
-        keep = C.benjamini_hochberg([t[2] for t in tested]) if tested else []
-        winner = None
-        for flag, (key, usable, _, guardable) in zip(keep, tested):
-            if not (flag and guardable):
-                continue
-            mdl = _mdl_fields(usable)
-            if mdl["dl_guard"] + mdl["dl_residual_given_guard"] < mdl["dl_residual"]:
-                winner = (key, usable, mdl)
-                break
-
         # §4.4 routing: a regime change is ONE-WAY. Locate the shift at the
         # argmax of cumulative deviation, test it exactly against the search
         # that found it, then ask whether either side changes AGAIN — if so the
         # series oscillates, which is dispersion wearing a changepoint costume,
         # and the repair is a condition or a question, never a supersede.
+        # (Computed BEFORE winner selection: Δ10's derived:prev must yield to it.)
         detected = C.changepoint_test(series)
         changepoint = detected[0] if detected else None
         changepoint_p = detected[1] if detected else None
         recurrent = C.is_recurrent(series) if detected else False
+        one_way = changepoint is not None and not recurrent
+
+        keep = C.benjamini_hochberg([t[2] for t in tested]) if tested else []
+        winner = None
+        # Δ10: recorded keys outrank derived ones at winner selection — the
+        # agent's own vocabulary is the primary explanation space; a synthesized
+        # frame speaks only when nothing the agent logged explains the variance.
+        ranked = sorted(zip(keep, tested),
+                        key=lambda ft: (C.is_derived(ft[1][0]), ft[1][0]))
+        for flag, (key, usable, _, guardable) in ranked:
+            if not (flag and guardable):
+                continue
+            if key == C.DERIVED_PREV:
+                # Self-lag is the frame most prone to shadowing OTHER structure:
+                # a one-way step makes prev≈current by construction (the honest
+                # repair is the located DATE, §4.4), and an unlogged block
+                # variable makes prev a smeared proxy (the honest repair is an
+                # open question saying "log wider"). prev may speak only when it
+                # ABSORBS the time structure it claims to explain: neither
+                # residual subseries may still carry temporal dispersion or a
+                # leftover step. A genuine sticky process passes (conditioned on
+                # prev, it is stationary); the shadows fail.
+                if one_way or not _prev_absorbs_time(obs):
+                    continue
+            mdl = _mdl_fields(usable)
+            if mdl["dl_guard"] + mdl["dl_residual_given_guard"] < mdl["dl_residual"]:
+                winner = (key, usable, mdl)
+                break
 
         if winner is not None:
             key, usable, mdl = winner
@@ -227,7 +255,7 @@ def _sweep_fact(idx, fact) -> list[tuple[str, dict[str, Any]]]:
                     hits += 1
                 else:
                     misses += 1
-            proposals.append(("guard", {
+            proposal = {
                 "head": {"pred": fact["pred"], "args": ["?x"]},
                 "body": {"literals": [],
                          "guards": [{"var": f"?{key}", "op": "==", "value": best}]},
@@ -236,7 +264,12 @@ def _sweep_fact(idx, fact) -> list[tuple[str, dict[str, Any]]]:
                 "holdout": {"hits": hits, "misses": misses},
                 "mdl": mdl, "specificity": 1, "conditioning_key": key,
                 "target_fact": fact["id"],
-            }))
+            }
+            if C.is_do(key):
+                # Δ13: conditioning on an intervention key is not a mere
+                # condition — it says the coupling is REGIME-dependent.
+                proposal["regime_dependent"] = True
+            proposals.append(("guard", proposal))
             idx.execute("UPDATE facts SET dispersion_flag=1 WHERE id=?",
                         (fact["id"],))
             _open_question(idx, fact["id"], usable, key)
@@ -269,7 +302,13 @@ def _sweep_fact(idx, fact) -> list[tuple[str, dict[str, Any]]]:
                 idx.execute("UPDATE facts SET dispersion_flag=1 WHERE id=?",
                             (fact["id"],))
                 if by_covariate:
-                    residual, ruled_out = tested[0][1], [t[0] for t in tested]
+                    # Show the strongest clustering no guard explains, not the
+                    # alphabetically first tested key (Δ10: derived keys sort
+                    # early and would otherwise displace the informative one).
+                    strongest = max(
+                        tested,
+                        key=lambda t: C.tarone_z(list(t[1].values())) or 0.0)
+                    residual, ruled_out = strongest[1], [t[0] for t in tested]
                 else:
                     # The residual partition IS the time blocks: "it is unstable
                     # across these stretches and nothing you logged says why."
@@ -279,13 +318,101 @@ def _sweep_fact(idx, fact) -> list[tuple[str, dict[str, Any]]]:
                 _open_question(idx, fact["id"], residual, None,
                                ruled_out=ruled_out)
 
-        # §4.6 breadth over confirming observations
-        confirming = {k: [ctx[k] for ctx, out in obs if out and k in ctx]
-                      for k in keys}
+        # §4.6 breadth over confirming observations — RECORDED context only (Δ10):
+        # breadth measures the agent's logging diversity; synthesized frames
+        # (hour, prev, interactions) must never inflate it.
+        rec_keys = sorted({k for ctx in base_ctx for k in ctx})
+        confirming = {k: [base_ctx[i][k]
+                          for i, (_, out) in enumerate(obs)
+                          if out and k in base_ctx[i]]
+                      for k in rec_keys}
         report = C.breadth_report(confirming)
         idx.execute("UPDATE facts SET breadth_class=? WHERE id=?",
                     (report["breadth_class"], fact["id"]))
     return proposals
+
+
+#: Δ11: the prospective audit speaks only past this many scored post-admission
+#: observations — the same floor a guard partition needs on each side at entry.
+MIN_AUDIT_OBS = 2 * C.MIN_SUPPORT_PER_PARTITION
+
+
+def prospective_guard_score(idx, body: dict[str, Any],
+                            admitted_seq: int) -> Optional[tuple[int, int]]:
+    """(hits, misses) of an admitted guard on observations AFTER its admission.
+
+    The entry holdout was scored once, on data that existed at proposal time;
+    this is the guard's PROSPECTIVE record — predictions risked on observations
+    that did not exist when it was admitted (Δ11). Scoring is identical to the
+    entry holdout: predict the outcome (or, for a categorical guard, whether
+    the conditioned value occurs) exactly when the conditioning key carries the
+    guard's value. Context is augmented with the Δ10 derived frames, so a guard
+    on `derived:*` is auditable like any other. Deterministic given the ledger;
+    the DECISION over the score belongs to the trusted side (§3.4), not here.
+
+    Returns None when fewer than MIN_AUDIT_OBS post-admission observations are
+    scorable — too little rent due to judge.
+    """
+    fid = body.get("target_fact")
+    key = body.get("conditioning_key")
+    guards = (body.get("body") or {}).get("guards") or []
+    if not fid or not key or not guards:
+        return None
+    best = guards[0].get("value")
+    cval = body.get("conditioned_value")           # set for categorical guards
+    rows = idx.query(
+        "SELECT o.event_seq, o.outcome, o.value, e.ts FROM observations o "
+        "JOIN events e ON e.seq = o.event_seq WHERE o.fact_id=? "
+        + ("AND o.value IS NOT NULL " if cval is not None else "")
+        + "ORDER BY o.event_seq", (fid,))
+    if not rows:
+        return None
+    ctx_rows = idx.query(
+        "SELECT oc.event_seq, oc.key, oc.value FROM obs_context oc "
+        "JOIN observations o ON o.event_seq = oc.event_seq "
+        "WHERE o.fact_id=?", (fid,))
+    by_seq: dict[int, dict[str, str]] = {}
+    for r in ctx_rows:
+        by_seq.setdefault(int(r["event_seq"]), {})[r["key"]] = r["value"]
+    base_ctx = [by_seq.get(int(r["event_seq"]), {}) for r in rows]
+    # prev derives from the FULL history (the first post-admission observation's
+    # prev is the last pre-admission one), then the score slices post-admission.
+    if cval is not None:
+        prevs: list = [None] + [rows[i - 1]["value"] for i in range(1, len(rows))]
+    else:
+        prevs = [None] + ["T" if bool(rows[i - 1]["outcome"]) else "F"
+                          for i in range(1, len(rows))]
+    aug = C.augment_derived(base_ctx, [int(r["ts"]) for r in rows], prevs)
+    hits = misses = 0
+    for i, r in enumerate(rows):
+        if int(r["event_seq"]) <= admitted_seq or key not in aug[i]:
+            continue
+        predicted = aug[i][key] == best
+        actual = (r["value"] == cval) if cval is not None else bool(r["outcome"])
+        if predicted == actual:
+            hits += 1
+        else:
+            misses += 1
+    if hits + misses < MIN_AUDIT_OBS:
+        return None
+    return hits, misses
+
+
+def _prev_absorbs_time(obs) -> bool:
+    """Does conditioning on derived:prev leave both subseries time-stable (Δ10)?
+
+    `obs` is the fact's augmented (ctx, outcome) list in event order. For each
+    prev value the conditioned subseries (still in time order) is checked for
+    residual temporal dispersion and for a leftover one-way step. Pure function
+    of the fact's own observations — resweep purity and replay hold.
+    """
+    for val in ("T", "F"):
+        sub = [out for ctx, out in obs if ctx.get(C.DERIVED_PREV) == val]
+        if C.temporal_dispersion(sub) is not None:
+            return False
+        if C.changepoint_test(sub) is not None:
+            return False
+    return True
 
 
 def _sweep_categorical_fact(idx, fact) -> list[tuple[str, dict[str, Any]]]:
@@ -310,7 +437,8 @@ def _sweep_categorical_fact(idx, fact) -> list[tuple[str, dict[str, Any]]]:
     """
     proposals: list[tuple[str, dict[str, Any]]] = []
     rows = idx.query(
-        "SELECT o.event_seq, o.value FROM observations o "
+        "SELECT o.event_seq, o.value, e.ts FROM observations o "
+        "JOIN events e ON e.seq = o.event_seq "
         "WHERE o.fact_id=? AND o.value IS NOT NULL ORDER BY o.event_seq",
         (fact["id"],))
     if len(rows) < MIN_OBS:
@@ -322,7 +450,13 @@ def _sweep_categorical_fact(idx, fact) -> list[tuple[str, dict[str, Any]]]:
     by_seq: dict[int, dict[str, str]] = {}
     for r in ctx_rows:
         by_seq.setdefault(int(r["event_seq"]), {})[r["key"]] = r["value"]
-    cat_obs = [(by_seq.get(int(r["event_seq"]), {}), r["value"]) for r in rows]
+    # Δ10: same derived-frame augmentation as the binary sweep; `derived:prev`
+    # carries the fact's PREVIOUS categorical value. Recorded context is kept
+    # separately for breadth.
+    base_ctx = [by_seq.get(int(r["event_seq"]), {}) for r in rows]
+    prevs: list = [None] + [rows[i - 1]["value"] for i in range(1, len(rows))]
+    aug = C.augment_derived(base_ctx, [int(r["ts"]) for r in rows], prevs)
+    cat_obs = [(aug[i], r["value"]) for i, r in enumerate(rows)]
     keys = sorted({k for ctx, _ in cat_obs for k in ctx})
     values = sorted({v for _, v in cat_obs})
 
@@ -354,7 +488,10 @@ def _sweep_categorical_fact(idx, fact) -> list[tuple[str, dict[str, Any]]]:
             tested.append((value, key, usable, pvalue, guardable))
     keep = C.benjamini_hochberg([t[3] for t in tested]) if tested else []
     winner = None
-    for flag, (value, key, usable, _, guardable) in zip(keep, tested):
+    # Δ10: recorded keys outrank derived ones, exactly as in the binary sweep.
+    ranked = sorted(zip(keep, tested),
+                    key=lambda ft: (C.is_derived(ft[1][1]), ft[1][0], ft[1][1]))
+    for flag, (value, key, usable, _, guardable) in ranked:
         if not (flag and guardable):
             continue
         mdl = _mdl_fields(usable)
@@ -379,7 +516,7 @@ def _sweep_categorical_fact(idx, fact) -> list[tuple[str, dict[str, Any]]]:
                 hits += 1
             else:
                 misses += 1
-        proposals.append(("guard", {
+        proposal = {
             "head": {"pred": fact["pred"], "args": ["?x"]},
             "body": {"literals": [],
                      "guards": [{"var": f"?{key}", "op": "==", "value": best}]},
@@ -388,7 +525,10 @@ def _sweep_categorical_fact(idx, fact) -> list[tuple[str, dict[str, Any]]]:
             "holdout": {"hits": hits, "misses": misses},
             "mdl": mdl, "specificity": 1, "conditioning_key": key,
             "conditioned_value": value, "target_fact": fact["id"],
-        }))
+        }
+        if C.is_do(key):
+            proposal["regime_dependent"] = True        # Δ13, as in the binary path
+        proposals.append(("guard", proposal))
         idx.execute("UPDATE facts SET dispersion_flag=1 WHERE id=?",
                     (fact["id"],))
         _open_question(idx, fact["id"], usable, key)
@@ -396,8 +536,10 @@ def _sweep_categorical_fact(idx, fact) -> list[tuple[str, dict[str, Any]]]:
     # §7 breadth for categorical: over ALL observations' recorded context (every
     # categorical observation is informative — there is no single "confirming"
     # outcome to filter on, unlike the binary path). Local to this branch, so
-    # binary breadth over confirming observations is untouched.
-    per_key = {k: [ctx[k] for ctx, _ in cat_obs if k in ctx] for k in keys}
+    # binary breadth over confirming observations is untouched. RECORDED keys
+    # only (Δ10): synthesized frames never inflate breadth.
+    rec_keys = sorted({k for ctx in base_ctx for k in ctx})
+    per_key = {k: [ctx[k] for ctx in base_ctx if k in ctx] for k in rec_keys}
     report = C.breadth_report(per_key)
     idx.execute("UPDATE facts SET breadth_class=? WHERE id=?",
                 (report["breadth_class"], fact["id"]))
@@ -408,7 +550,14 @@ def _open_question(idx, fact_id: str, groups: dict[str, C.Group],
                    explained_key, ruled_out=()) -> None:
     from ..core.hashing import canon_json
     z = C.tarone_z(list(groups.values()))
-    if explained_key:
+    if explained_key and C.is_do(explained_key):
+        # Δ13: an intervention key does not merely condition — the coupling was
+        # regime-dependent, and pre-intervention observation cannot price the
+        # post-intervention world.
+        suggestion = (f"regime dependence on '{explained_key}': the association "
+                      "holds within one intervention regime and does not "
+                      "transfer across do(...)")
+    elif explained_key:
         suggestion = f"guard proposed on '{explained_key}'"
     elif ruled_out:
         # structure detected, but every recorded key was tested and none

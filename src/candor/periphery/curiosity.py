@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import math
 import random
+import time
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 # §4.5 gate-hard defaults, because covariate search is a fishing expedition.
 MIN_SUPPORT_PER_PARTITION = 8
@@ -153,6 +154,99 @@ def partition_by_key(observations: Iterable[tuple[dict[str, str], bool]],
 #: honest "cannot attribute this to any value of the key" mass. A dunder so it can
 #: never collide with a real context value (values are plain strings).
 RESIDUAL_BUCKET = "__residual__"
+
+
+# ── derived context: frames the agent never logged (v0.6 Δ10) ────────────────
+#
+# The covariate sweep can only condition on keys somebody recorded — which is
+# the C-17 wall: selecting the variable frame is itself the unautomated step.
+# These helpers push that wall outward by SYNTHESIZING candidate frames from
+# data the ledger already holds (event timestamps, the fact's own outcome
+# history, compositions of recorded keys). Everything downstream — Tarone, BH,
+# MDL, the held-out split, the gate — runs unchanged on them. This is bounded
+# frame construction: composition over an internal basis, not analogy from
+# nothing, and it is a pure function of the fact's own observations, so the
+# resweep purity contract (H6b) and replay determinism (I3/I8) hold verbatim.
+
+#: Δ13 — reserved prefix for INTERVENTION context: a `do:` key records that the
+#: agent (or its principal) was acting on the world, not merely watching it.
+#: The statistics are unchanged — a do: key partitions like any covariate — but
+#: the SEMANTICS differ where it matters: a guard on a do: key is labeled
+#: regime dependence (P(·|observe) ≠ P(·|do), the association does not transfer
+#: across the boundary), and predictions pooling across mixed do: regimes carry
+#: a `regime_mixed` caveat. Detection is post-hoc by construction: nothing here
+#: predicts what an intervention WILL change before post-intervention data
+#: exists — that requires a causal model, which observational machinery cannot
+#: supply (the LC-3 boundary).
+DO_PREFIX = "do:"
+
+
+def is_do(key: str) -> bool:
+    return key.startswith(DO_PREFIX)
+
+
+#: Namespace prefix for synthesized keys. Recorded context can never collide
+#: (agent keys are free-form but the sweep treats any key with this prefix as
+#: system-derived: excluded from breadth, outranked by recorded keys at winner
+#: selection).
+DERIVED_PREFIX = "derived:"
+DERIVED_HOUR = DERIVED_PREFIX + "hour"    # UTC hour-of-day "00".."23"
+DERIVED_DOW = DERIVED_PREFIX + "dow"      # UTC day-of-week "0" (Mon) .. "6"
+DERIVED_PREV = DERIVED_PREFIX + "prev"    # previous outcome/value of THIS fact
+
+#: Pairwise interaction keys are synthesized only when the fact records at most
+#: this many distinct keys — a documented bound, not a silent cap: above it the
+#: O(K²) pairs dilute the BH budget faster than they add power. 4 is measured,
+#: not guessed: at 6, a fact with six recorded keys (one weak-but-real covariate
+#: plus five nuisance keys — the preregistered 0.70-vs-0.40 world) gains 15 null
+#: pair tests and its recovery rate drops below the claims-suite floor.
+MAX_INTERACTION_KEYS = 4
+
+
+def is_derived(key: str) -> bool:
+    return key.startswith(DERIVED_PREFIX)
+
+
+def augment_derived(ctxs: Sequence[Mapping[str, str]],
+                    tss: Sequence[Optional[int]],
+                    prevs: Sequence[Optional[str]]) -> list[dict[str, str]]:
+    """Recorded context augmented with synthesized candidate frames.
+
+    Per observation i:
+      * ``derived:hour`` / ``derived:dow`` from the event timestamp (ms, UTC) —
+        periodic structure the CUSUM/temporal machinery cannot see (it detects
+        level changes and block spread, never phase);
+      * ``derived:prev`` = ``prevs[i]`` — the fact's previous outcome ("T"/"F")
+        or previous categorical value; None (first observation) records nothing,
+        so it lands in the residual bucket honestly;
+      * ``derived:{k1}x{k2}`` = ``"v1|v2"`` for every pair of RECORDED keys both
+        present on the observation — conjunctive missing variables ("fails when
+        region=eu AND hour=03") that no single-key partition can expose.
+
+    Deterministic and order-independent given (ctxs, tss, prevs); inputs are
+    never mutated. Interaction keys use the recorded vocabulary only (no
+    derived×derived: hour×dow-style blowup buys cardinality, not insight).
+    """
+    recorded = sorted({k for ctx in ctxs for k in ctx})
+    pair_keys = recorded if len(recorded) <= MAX_INTERACTION_KEYS else []
+    out: list[dict[str, str]] = []
+    for i, ctx in enumerate(ctxs):
+        aug = dict(ctx)
+        ts = tss[i] if i < len(tss) else None
+        if ts is not None:
+            t = time.gmtime(ts / 1000.0)
+            aug[DERIVED_HOUR] = f"{t.tm_hour:02d}"
+            aug[DERIVED_DOW] = str(t.tm_wday)
+        prev = prevs[i] if i < len(prevs) else None
+        if prev is not None:
+            aug[DERIVED_PREV] = prev
+        for a_i in range(len(pair_keys)):
+            for b_i in range(a_i + 1, len(pair_keys)):
+                ka, kb = pair_keys[a_i], pair_keys[b_i]
+                if ka in ctx and kb in ctx:
+                    aug[f"{DERIVED_PREFIX}{ka}x{kb}"] = f"{ctx[ka]}|{ctx[kb]}"
+        out.append(aug)
+    return out
 
 
 def outcome_breakdown(observations: Iterable[tuple[dict[str, str], bool]],

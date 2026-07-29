@@ -248,6 +248,19 @@ def _apply_demotion(idx: "Index", ev: "Event", payload: dict[str, Any]) -> None:
         idx.execute("UPDATE rules SET structural='candidate' WHERE id=?", (target,))
     else:
         idx.execute("UPDATE facts SET structural='candidate' WHERE id=?", (target,))
+    # Δ11: a prospective-audit demotion also closes out the source candidate, so
+    # the read paths that surface admitted guards stop naming it and the gate's
+    # re-entry bar can see the against-evidence. Additive: demotion events
+    # without candidate_id fold exactly as before.
+    cid = payload.get("candidate_id")
+    if cid:
+        # `at` (the demotion's own event seq) marks where the judged record
+        # ends: re-entry evidence must come from observations AFTER it.
+        record = dict(payload.get("scored") or {})
+        record["at"] = ev.seq
+        idx.execute(
+            "UPDATE candidates SET status='demoted', reason=? WHERE id=?",
+            (canon_json(record), cid))
 
 
 def _apply_claim(idx: "Index", ev: "Event", payload: dict[str, Any]) -> None:

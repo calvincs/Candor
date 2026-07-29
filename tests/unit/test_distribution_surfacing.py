@@ -182,6 +182,7 @@ def test_distribution_on_an_unknown_or_undispersed_fact_is_trivial(sys_):
     d = m.distribution({"pred": "nope", "args": ["x"]})
     assert d == {"found": False, "fact_id": None, "stmt_type": None, "n_obs": 0,
                  "flaky": False, "dispersion_flag": False, "modes": {},
+                 "derived_modes": {},
                  "residual": {"conditioning_key": None, "explained": 0.0,
                               "unexplained": 0.0, "dispersion_stat": None}}
 

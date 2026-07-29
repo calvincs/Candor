@@ -89,7 +89,10 @@ CREATE TABLE IF NOT EXISTS candidates(
     ('fact','rule','guard','verifier','symbol','alias','constraint',
      'supersede_valid_time')),
   body_json TEXT NOT NULL, span_ref TEXT, proposer TEXT NOT NULL,
-  status TEXT NOT NULL CHECK(status IN ('pending','admitted','rejected','superseded')),
+  -- 'demoted' (Δ11): admitted, then removed by the prospective audit; the row
+  -- keeps the against-evidence the gate's re-entry bar holds re-proposals to.
+  status TEXT NOT NULL CHECK(status IN
+    ('pending','admitted','rejected','superseded','demoted')),
   gate_run_id TEXT, failing_step INTEGER, reason TEXT);
 
 -- ── COMMITTED TIER ───────────────────────────────────────────────────────
