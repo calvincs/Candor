@@ -95,7 +95,7 @@ CREATE TABLE IF NOT EXISTS candidates(
 -- ── COMMITTED TIER ───────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS facts(
   id TEXT PRIMARY KEY, pred TEXT NOT NULL, args_json TEXT NOT NULL,
-  stmt_type TEXT NOT NULL CHECK(stmt_type IN ('crisp','frequency')),
+  stmt_type TEXT NOT NULL CHECK(stmt_type IN ('crisp','frequency','categorical')),
   kind TEXT NOT NULL CHECK(kind IN ('exact','soft','definitional')),
   sim REAL,
   structural TEXT NOT NULL CHECK(structural IN ('candidate','admitted','pinned')),
@@ -111,6 +111,16 @@ CREATE TABLE IF NOT EXISTS fact_counts(
   channel TEXT NOT NULL CHECK(channel IN ('epi','alea')),
   n INTEGER NOT NULL, k INTEGER NOT NULL,
   PRIMARY KEY(fact_id, actor, channel));
+
+-- v0.5 (categorical C1): open-vocabulary per-value tallies. Integers, keyed by
+-- (fact, actor, value); a brand-new value is simply a new row. DISJOINT from
+-- fact_counts so every crisp/frequency read/write path is byte-for-byte
+-- untouched. Every probability (incl. the unseen slice) is a read-time
+-- composition — same I11 discipline as fact_counts.
+CREATE TABLE IF NOT EXISTS fact_category_counts(
+  fact_id TEXT NOT NULL, actor TEXT NOT NULL, value TEXT NOT NULL,
+  n INTEGER NOT NULL,
+  PRIMARY KEY(fact_id, actor, value));
 
 CREATE TABLE IF NOT EXISTS rules(
   id TEXT PRIMARY KEY, head_json TEXT NOT NULL, body_json TEXT NOT NULL,
@@ -164,7 +174,9 @@ CREATE TABLE IF NOT EXISTS calibration(
 CREATE TABLE IF NOT EXISTS observations(
   event_seq INTEGER PRIMARY KEY, fact_id TEXT, actor TEXT, outcome INTEGER,
   grade INTEGER NOT NULL DEFAULT 0,   -- v0.4 Δ6: 0=ungraded, 1..3 by confidence
-  channel TEXT, context_sig TEXT, ts INTEGER);
+  channel TEXT, context_sig TEXT,
+  value TEXT,                         -- v0.5 (categorical C1): NULL unless categorical
+  ts INTEGER);
 CREATE TABLE IF NOT EXISTS obs_context(
   event_seq INTEGER NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
   PRIMARY KEY(event_seq, key));
@@ -190,6 +202,7 @@ CREATE TABLE IF NOT EXISTS eval_queue(
   cost REAL, score REAL, PRIMARY KEY(target_kind, target_id));
 
 CREATE INDEX IF NOT EXISTS ix_fc_fact ON fact_counts(fact_id);
+CREATE INDEX IF NOT EXISTS ix_fcc_fact ON fact_category_counts(fact_id);
 CREATE INDEX IF NOT EXISTS ix_obs_fact ON observations(fact_id);
 CREATE INDEX IF NOT EXISTS ix_cand_status ON candidates(status);
 CREATE INDEX IF NOT EXISTS ix_pins_target ON pins(target_id);
@@ -198,6 +211,7 @@ CREATE INDEX IF NOT EXISTS ix_pins_target ON pins(target_id);
 # Columns that hold counts. The integrality scan (I11) walks exactly these.
 COUNT_COLUMNS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
     ("fact_counts", ("n", "k"), ("fact_id", "actor", "channel")),
+    ("fact_category_counts", ("n",), ("fact_id", "actor", "value")),
     ("rule_counts", ("n", "k"), ("rule_id", "actor")),
     ("actor_confusion", ("tp", "fn", "fp", "tn"), ("actor", "frame")),
     ("actor_response", ("n_true", "n_false"), ("actor", "frame", "vote", "grade")),

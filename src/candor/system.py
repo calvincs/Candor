@@ -453,13 +453,26 @@ class CandorSystem:
                 f"{actor} exhausted its {kind} quota for this epoch "
                 f"({used}/{limit})")
 
-    def observe(self, stmt: Mapping[str, Any], outcome: bool,
-                ctx: Mapping[str, str], actor: str,
+    def observe(self, stmt: Mapping[str, Any], outcome: Optional[bool] = None,
+                ctx: Optional[Mapping[str, str]] = None, actor: str = "",
+                value: Optional[str] = None,
                 confidence: Optional[float] = None,
                 ts: Optional[int] = None) -> int:
+        """Record an observation (§3.7).
+
+        `value` (categorical C1, §1.4) is the realised category for a categorical
+        fact. Existing callers pass `outcome` and leave `value=None` — the
+        UNCHANGED crisp/frequency path. For a categorical fact the caller passes
+        `value="captcha"` and `outcome` is ignored. Which field is authoritative
+        is decided at FOLD time by the fact's stmt_type, not here (so an
+        observation arriving before its fact is admitted still routes correctly on
+        replay). The value rides in the ledger payload for audit, exactly as raw
+        `confidence` does for graded observations.
+        """
         self._check_quota(actor, "observation")
         payload = {"stmt": {"pred": stmt["pred"], "args": list(stmt["args"])},
-                   "outcome": bool(outcome), "ctx": dict(ctx or {}),
+                   "outcome": None if outcome is None else bool(outcome),
+                   "value": value, "ctx": dict(ctx or {}),
                    "grade": reliability_mod.grade_of(confidence),
                    "confidence": confidence}
         # A historical replay passes the real event time so a located changepoint
@@ -928,6 +941,13 @@ class CandorSystem:
         row = idx.one("SELECT stmt_type, dispersion_flag, breadth_class FROM facts "
                       "WHERE id=?", (fact_id,))
         stmt_type = row["stmt_type"] if row else "crisp"
+        # C1 stores a categorical fact and folds it deterministically, but the
+        # Dirichlet/CRP posterior + CategoricalPrediction return type land in C2.
+        # Guard with a clear error rather than treating it as a scalar-p fact and
+        # returning a silent wrong answer (its counts live in fact_category_counts,
+        # so compose() would see zero epi/alea and hand back a bogus prior).
+        if stmt_type == "categorical":
+            raise NotImplementedError("categorical predict lands in C2")
         composed = counts_mod.compose(idx, [fact_id])
         epi, alea = counts_mod.posterior_params(composed, stmt_type)
         if row is None:

@@ -128,10 +128,15 @@ def _apply_admission(idx: "Index", ev: "Event", payload: dict[str, Any]) -> None
              body.get("valid_from", ev.ts), body.get("valid_to"), ev.ts, ev.seq))
         # The admitted fact's audit trail is addressable from admission onward,
         # keyed by its proposer, at zero (I5: unobserved is ε, never a hard 0).
-        proposer = idx.one("SELECT proposer FROM candidates WHERE id=?", (cid,))
-        counts_mod.ensure_row(
-            idx, fid, proposer["proposer"] if proposer else ev.actor,
-            counts_mod.channel_for(body["stmt_type"]))
+        # A categorical fact has an OPEN vocabulary with no value known at
+        # admission, so there is no single baseline row to seed — its per-value
+        # tallies (fact_category_counts) become addressable on the first
+        # observation. So skip channel_for (which knows only epi/alea) for it.
+        if body["stmt_type"] != "categorical":
+            proposer = idx.one("SELECT proposer FROM candidates WHERE id=?", (cid,))
+            counts_mod.ensure_row(
+                idx, fid, proposer["proposer"] if proposer else ev.actor,
+                counts_mod.channel_for(body["stmt_type"]))
     elif kind == "constraint":
         idx.execute(
             "INSERT OR REPLACE INTO constraints(id, kind, body_json, structural, "
@@ -167,25 +172,45 @@ def _apply_alias(idx: "Index", ev: "Event", payload: dict[str, Any]) -> None:
 
 def _apply_observation(idx: "Index", ev: "Event", payload: dict[str, Any]) -> None:
     stmt = payload["stmt"]
-    outcome = bool(payload["outcome"])
     ctx = payload.get("ctx") or {}
+    value = payload.get("value")
     fid = facts_mod.lookup(idx, stmt["pred"], stmt["args"])
-    channel = None
+    # Which field is authoritative is decided HERE, at fold time, by the fact's
+    # stmt_type — not at the API (§1.4). An observation that arrives before its
+    # fact is admitted has fid=None and simply attributes nothing, exactly as the
+    # crisp/frequency path already does.
+    stmt_type = None
     if fid is not None:
         row = idx.one("SELECT stmt_type FROM facts WHERE id=?", (fid,))
-        channel = counts_mod.channel_for(row["stmt_type"])
-        counts_mod.apply_observation(idx, fid, ev.actor, channel, outcome)
+        stmt_type = row["stmt_type"] if row else None
+    categorical = stmt_type == "categorical"
+    channel: Optional[str] = None
+    outcome_col: Optional[int] = None
+    outcome = bool(payload.get("outcome"))
+    if categorical:
+        # Categorical: the realised value moves the per-value tallies; outcome is
+        # ignored and stored NULL. channel='cat' partitions these rows off the
+        # epi/alea observation stream.
+        channel = "cat"
+        counts_mod.apply_category_observation(idx, fid, ev.actor, value)
+    else:
+        outcome_col = 1 if outcome else 0
+        if fid is not None:
+            channel = counts_mod.channel_for(stmt_type)
+            counts_mod.apply_observation(idx, fid, ev.actor, channel, outcome)
     idx.execute(
         "INSERT OR REPLACE INTO observations(event_seq, fact_id, actor, outcome, "
-        "grade, channel, context_sig, ts) VALUES(?,?,?,?,?,?,?,?)",
-        (ev.seq, fid, ev.actor, 1 if outcome else 0,
-         int(payload.get("grade", 0)), channel, ev.context_sig, ev.ts))
-    for key, value in sorted(ctx.items()):
+        "grade, channel, context_sig, value, ts) VALUES(?,?,?,?,?,?,?,?,?)",
+        (ev.seq, fid, ev.actor, outcome_col,
+         int(payload.get("grade", 0)), channel, ev.context_sig, value, ev.ts))
+    for key, cval in sorted(ctx.items()):
         idx.execute(
             "INSERT OR REPLACE INTO obs_context(event_seq, key, value) VALUES(?,?,?)",
-            (ev.seq, str(key), str(value)))
+            (ev.seq, str(key), str(cval)))
     _bump_quota(idx, ev.actor, "observation")
-    if fid is not None:
+    # Pin tension is a boolean-outcome semantics; a categorical observation has no
+    # true/false outcome to contradict a '-' pin, so it is skipped for those.
+    if fid is not None and not categorical:
         _check_pin_tension(idx, ev, fid, outcome)
 
 
@@ -438,6 +463,8 @@ _HASH_QUERIES: tuple[tuple[str, str], ...] = (
               "FROM facts ORDER BY id"),
     ("fact_counts", "SELECT fact_id, actor, channel, n, k FROM fact_counts "
                     "ORDER BY fact_id, actor, channel"),
+    ("fact_category_counts", "SELECT fact_id, actor, value, n FROM "
+                             "fact_category_counts ORDER BY fact_id, actor, value"),
     ("rules", "SELECT id, head_json, body_json, specificity, structural, numeric, "
               "admitted_at FROM rules ORDER BY id"),
     ("rule_counts", "SELECT rule_id, actor, n, k FROM rule_counts ORDER BY rule_id, actor"),

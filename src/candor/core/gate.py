@@ -136,7 +136,7 @@ def _evaluate_fact(idx: "Index", cid: str, body: dict[str, Any]) -> Decision:
                            "no canonical numeric normal form")
 
     stmt_type = body.get("stmt_type", "crisp")
-    if stmt_type not in ("crisp", "frequency"):
+    if stmt_type not in ("crisp", "frequency", "categorical"):
         return _reject(cid, "fact", 1, f"unknown stmt_type {stmt_type!r}")
 
     fid = fact_key(pred, cargs)

@@ -82,6 +82,30 @@ def apply_observation(idx: "Index", fact_id: str, actor: str, channel: str,
         (1 if outcome else 0, fact_id, actor, channel))
 
 
+def apply_category_observation(idx: "Index", fact_id: str, actor: str,
+                               value: str) -> None:
+    """Integer increment of a per-value tally (categorical C1, §1.4).
+
+    Exact analog of `apply_observation`: respects numeric='frozen' as a no-op,
+    INSERT OR IGNORE a zero row then UPDATE n=n+1. The open vocabulary is
+    expressed by a brand-new value simply becoming a new (fact,actor,value) row.
+    Integer increment, never a delta — so fold order is irrelevant to the stored
+    counts (I3), same guarantee fact_counts already relies on.
+    """
+    if value is None:
+        return
+    row = idx.one("SELECT numeric FROM facts WHERE id=?", (fact_id,))
+    if row is None or row["numeric"] == "frozen":
+        return
+    value = str(value)
+    idx.execute(
+        "INSERT OR IGNORE INTO fact_category_counts(fact_id, actor, value, n) "
+        "VALUES(?,?,?,0)", (fact_id, actor, value))
+    idx.execute(
+        "UPDATE fact_category_counts SET n = n + 1 "
+        "WHERE fact_id=? AND actor=? AND value=?", (fact_id, actor, value))
+
+
 def apply_rule_observation(idx: "Index", rule_id: str, actor: str,
                            outcome: bool) -> None:
     idx.execute(
