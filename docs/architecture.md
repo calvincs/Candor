@@ -23,6 +23,15 @@ The chain covers payload *commitments*, not payloads — so redacting a payload
 downstream state *without* the redacted content. Torn writes recover by
 truncating to the last verifying line: loss, never silent corruption.
 
+The chain is a **consistency** mechanism, not a **tamper-evidence** one. Each
+event commits to its predecessor's hash, so `verify_chain()` catches accidental
+corruption, torn writes, and two processes forking the same log — the failure
+modes that lose or scramble data. It does *not* prove the log was never
+rewritten: anyone who can edit a segment can recompute every hash after their
+edit and the chain will verify. Tamper-evidence against a writer with that
+access needs an external anchor (a signed or notarised head), which CANDOR
+leaves to the deployment — see [SECURITY.md](../SECURITY.md).
+
 ## Trusted core vs untrusted periphery
 
 LCF-style separation, enforced physically by the source tree:
@@ -122,6 +131,16 @@ A sweep over the observation log that treats instability as information:
   logged* is told "log wider" instead of getting silence. When a new covariate
   starts being recorded later, open questions are re-tested against it
   automatically.
+
+**Timing and `closure_hash`.** The sweep is batch-triggered, not
+per-observation: `run_gate()` runs it, and a reopen re-runs it while folding.
+Between a bare `observe()` and the next `run_gate()` or reopen, the derived
+*sweep* outputs (a fact's breadth and dispersion flags) still reflect the
+previous sweep, so `closure_hash()` in that window is a faithful snapshot of a
+deliberately stale sweep — true of crisp, frequency, and categorical facts
+alike. Live state equals replayed state *after* any `run_gate()` or reopen,
+which is exactly where the I3 equivalence is asserted; call `run_gate()` before
+comparing closure hashes across processes.
 
 ## Spec lineage
 

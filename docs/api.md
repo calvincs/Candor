@@ -37,7 +37,11 @@ Runs the curiosity sweep, then drains all pending candidates through the
 seven admission steps. Each run reports `candidate_kind`, `status`
 (`admitted`/`rejected`), and the `failing_step` + reason on rejection.
 Units are canonicalized at admission: `212F` is stored as `373.15K` and the
-fact is readable under either notation.
+fact is readable under either notation. The sweep is batch-triggered, so a
+fact's breadth/dispersion flags — and therefore `closure_hash()` — only reflect
+the latest observations after a `run_gate()` or a reopen; call it before
+comparing closure hashes across processes (see
+[architecture.md](architecture.md#the-curiosity-engine-stage-5)).
 
 ### `observe(stmt, outcome, ctx, actor, confidence=None) -> event_seq`
 An attributed outcome report. `ctx` is free-form key/value ambient state —
@@ -68,12 +72,22 @@ contributing, and every downstream number — counts, trust, predictions —
 recomputes as if it never spoke. Append-only and reversible. **This is how you
 recover from a bad source.**
 
-### `redact(payload_hash) -> event_seq`
+### `redact(payload_hash, authority="human:operator") -> event_seq`
 Deletes a payload; the chain still verifies; replay recomputes all state
 without the content. Scoped to *content*, not to a source: payloads are
 content-addressed and carry no actor, so every event sharing the hash loses its
 payload whoever wrote it. Use it for secrets and PII, check
 `redaction_scope(payload_hash)` first, and use `retract_source` for a bad actor.
+
+### `set_authz(policy)` — opt-in access control
+By default `authority`/`actor` are attribution labels, not authenticated
+identities (the trust boundary is the process; see [SECURITY.md](../SECURITY.md)).
+Register a policy `(principal, op) -> bool` and CANDOR enforces it on the
+privileged writes — `pin`, `redact`, `retract_source`, `register_oracle`,
+`set_reliability` — raising `Unauthorized` **before** any ledger append, so a
+denied call mutates nothing. `set_authz(None)` restores advisory mode. The
+policy is runtime config, never part of replay: an existing ledger is never
+re-checked.
 
 ## Reading
 

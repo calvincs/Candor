@@ -12,10 +12,11 @@ from __future__ import annotations
 import json
 import shutil
 import tempfile
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 from .core import apply as apply_mod
 from .core import calibration as calibration_mod
@@ -48,6 +49,14 @@ _HEALTH_EVENTS_CAP = 1000
 
 class QuotaExceeded(RuntimeError):
     """§3.12 flooding bound. Raised at the API boundary, before the ledger."""
+
+
+class Unauthorized(RuntimeError):
+    """A registered authorization policy denied a privileged write (M3).
+
+    Raised at the API boundary, before any ledger append, so a denied call
+    mutates nothing. Only ever raised when `set_authz` has installed a policy;
+    the default posture is advisory (see SECURITY.md)."""
 
 
 class Refused(RuntimeError):
@@ -119,6 +128,13 @@ class CandorSystem:
         # it would re-propose byte-identical candidates — an idle run_gate can
         # skip it. None until the first sweep actually runs.
         self._sweep_obs_watermark: Optional[int] = None
+        # M3: optional authorization policy for privileged writes. None means
+        # advisory (the default posture): `authority`/`actor` are attribution
+        # labels only. A policy is a callable (principal, op) -> bool; see
+        # set_authz. It is a runtime guard like the quota limits — not ledger
+        # state — so it never enters the closure hash and replay never re-checks
+        # it (every event already in the chain was admitted when written).
+        self._authz: Optional[Callable[[str, str], bool]] = None
         self.open()
 
     # ── lifecycle ────────────────────────────────────────────────────────────
@@ -375,14 +391,15 @@ class CandorSystem:
 
     def assert_(self, stmt: Mapping[str, Any], source: str, actor: str) -> str:
         """§5 assert → candidate_id. Never a fact (I10)."""
-        self._check_quota(actor, "candidate")
+        eff_ts = self._now_ms()
+        self._check_quota(actor, "candidate", apply_mod.epoch_of(eff_ts))
         proposals = extractor_mod.propose(stmt, self._known_predicates())
         last = ""
         for kind, body in proposals:
             ev = self.ledger.append(
                 "assertion", actor,
                 {"candidate_kind": kind, "body": body},
-                source_ref=source)
+                source_ref=source, ts=eff_ts)
             apply_mod.apply_event(self.index, ev, {"candidate_kind": kind, "body": body})
             last = apply_mod.candidate_id_for(ev.seq)
         self.index.commit()
@@ -463,19 +480,54 @@ class CandorSystem:
                                (int(cand_per_epoch), actor))
         self.index.commit()
 
-    def _check_quota(self, actor: str, kind: str) -> None:
+    @staticmethod
+    def _now_ms() -> int:
+        """Wall-clock event time in ms — matches ledger.append's own default."""
+        return int(time.time() * 1000)
+
+    def _check_quota(self, actor: str, kind: str, epoch: int) -> None:
+        """§3.12 flooding bound, evaluated for the epoch the impending event
+        falls in. The caller derives `epoch` from the event's timestamp and
+        stamps that same ts on the append, so the check and the fold-time bump
+        agree on the bucket even at an epoch boundary."""
         limit = apply_mod.quota_limit(self.index, actor, kind)
-        used = apply_mod.quota_used(self.index, actor, kind)
+        used = apply_mod.quota_used(self.index, actor, kind, epoch)
         if used >= limit:
             self._health_events.append({
                 "kind": "quota_exhausted", "actor": actor, "quota_kind": kind,
-                "used": used, "limit": limit})
+                "epoch": epoch, "used": used, "limit": limit})
             apply_mod.diagnostic(self.index, 0, "quota_exhausted",
-                                 {"actor": actor, "quota_kind": kind, "limit": limit})
+                                 {"actor": actor, "quota_kind": kind,
+                                  "epoch": epoch, "limit": limit})
             self.index.commit()
             raise QuotaExceeded(
-                f"{actor} exhausted its {kind} quota for this epoch "
+                f"{actor} exhausted its {kind} quota for epoch {epoch} "
                 f"({used}/{limit})")
+
+    def set_authz(self, policy: Optional[Callable[[str, str], bool]]) -> None:
+        """Install (or clear) an authorization policy for privileged writes (M3).
+
+        `policy(principal, op) -> bool` is consulted before every privileged
+        write — pin, redact, retract_source, register_oracle, set_reliability —
+        with the caller-supplied authority label and the operation name; a
+        falsy return raises `Unauthorized` before anything is appended. Passing
+        `None` restores the default advisory posture, in which `authority` is an
+        attribution label and access control is the embedding app's job (the
+        trust boundary is the process; see SECURITY.md).
+
+        The policy is runtime configuration, not ledger state: it never enters
+        the closure hash, and replay of an existing ledger never re-checks it.
+        """
+        self._authz = policy
+
+    def _authorize(self, principal: str, op: str) -> None:
+        """Gate a privileged write. A no-op unless a policy is registered."""
+        if self._authz is not None and not self._authz(principal, op):
+            # Reject before any ledger append or index mutation; record the
+            # attempt in the in-memory health log only (audit, not replay state).
+            self._health_events.append(
+                {"kind": "unauthorized", "principal": principal, "op": op})
+            raise Unauthorized(f"{principal!r} is not authorized to {op}")
 
     def observe(self, stmt: Mapping[str, Any], outcome: Optional[bool] = None,
                 ctx: Optional[Mapping[str, str]] = None, actor: str = "",
@@ -493,16 +545,19 @@ class CandorSystem:
         replay). The value rides in the ledger payload for audit, exactly as raw
         `confidence` does for graded observations.
         """
-        self._check_quota(actor, "observation")
+        # Fix the event time up front so the quota check and the fold-time bump
+        # agree on the epoch; ts=None keeps the ingest wall clock (§3.1), and a
+        # historical replay passes the real event time (so a located changepoint
+        # gets the real valid_to).
+        eff_ts = ts if ts is not None else self._now_ms()
+        self._check_quota(actor, "observation", apply_mod.epoch_of(eff_ts))
         payload = {"stmt": {"pred": stmt["pred"], "args": list(stmt["args"])},
                    "outcome": None if outcome is None else bool(outcome),
                    "value": value, "ctx": dict(ctx or {}),
                    "grade": reliability_mod.grade_of(confidence),
                    "confidence": confidence}
-        # A historical replay passes the real event time so a located changepoint
-        # gets the real valid_to; ts=None keeps the ingest wall clock (§3.1).
         ev = self.ledger.append("observation", actor, payload,
-                                context_sig=context_signature(ctx), ts=ts)
+                                context_sig=context_signature(ctx), ts=eff_ts)
         apply_mod.apply_event(self.index, ev, payload)
         self.index.commit()
         return ev.seq
@@ -518,6 +573,7 @@ class CandorSystem:
         return out
 
     def pin(self, target_id: str, polarity: str, reason: str, authority: str) -> int:
+        self._authorize(authority, "pin")
         # Validate at the boundary, before the ledger append (C3): the index's
         # pins.polarity CHECK would otherwise reject the event only after it was
         # already in the chain, bricking every future replay.
@@ -578,6 +634,7 @@ class CandorSystem:
         Append-only and reversible: `restore=True` un-silences, and the whole
         history stays in the chain either way.
         """
+        self._authorize(authority, "retract_source")
         payload = {"actor": actor, "reason": reason, "restore": bool(restore)}
         ev = self.ledger.append("retraction", authority, payload)
         self.index.reset()
@@ -599,13 +656,19 @@ class CandorSystem:
         return {"payload_hash": payload_hash, "events": len(rows),
                 "actors": actors, "shared": len(actors) > 1}
 
-    def redact(self, payload_hash: str) -> int:
+    def redact(self, payload_hash: str, authority: str = "human:operator") -> int:
         """Purge one payload's CONTENT everywhere it appears.
 
         Scoped to content, not to a source: every event carrying this hash
         loses its payload, whoever wrote it. See `redaction_scope` for the
         blast radius, and `retract_source` to silence a single actor instead.
+
+        `authority` names the principal requesting the purge; it defaults to the
+        historical `human:operator` label and gates the write when an
+        authorization policy is installed (M3). The recorded redaction event
+        actor is unchanged, so the ledger is byte-identical for existing callers.
         """
+        self._authorize(authority, "redact")
         # Reject a bad hash at the boundary, before appending anything (M4):
         # the argument flows into `cas_dir / f"{payload_hash}.json"`, so a value
         # with `..` in it would unlink a file outside the store.
@@ -714,6 +777,7 @@ class CandorSystem:
         direct SQLite write here would vanish on replay (the test that caught
         exactly that lives in tests/unit/test_two_coin.py).
         """
+        self._authorize(authority, "register_oracle")
         payload = {
             "candidate_id": f"cand:oracle:{oracle_id}",
             "candidate_kind": "verifier", "status": "admitted",
@@ -823,10 +887,13 @@ class CandorSystem:
             return False
         if row["kind"] == "definitional" or row["numeric"] == "frozen":
             return False
-        # exact-derived facts are blame-ineligible; base admitted facts are not.
-        atom = self.index.one(
-            "SELECT admitted_by_event FROM facts WHERE id=?", (component,))
-        return atom is not None
+        # What remains is a stored fact that was admitted (admitted_by_event is
+        # always set on insert), non-definitional and not frozen — a base
+        # admitted fact, which is blame-eligible. Facts DERIVED through a rule
+        # are never stored here (they live in the read-time closure), so the
+        # "exact-derived facts are ineligible" rule already holds by
+        # construction — there is nothing further to exclude.
+        return True
 
     # ── reads ────────────────────────────────────────────────────────────────
     def recall(self, query: str, budget: int,
@@ -1224,6 +1291,7 @@ class CandorSystem:
         like everything else, so a ledger-only rebuild reproduces it (I1) and it
         composes with settlements at its true position (I3).
         """
+        self._authorize(authority, "set_reliability")
         # Validate before appending (C3): actor_reliability's frame CHECK would
         # otherwise reject the event only after it is already in the chain,
         # bricking every future replay.
@@ -1455,7 +1523,8 @@ class CandorSystem:
                        "SELECT breadth_class, COUNT(*) AS c FROM facts "
                        "GROUP BY breadth_class")}
         quota_rows = self.index.query(
-            "SELECT actor, kind, used FROM quota_usage ORDER BY actor, kind")
+            "SELECT actor, kind, SUM(used) AS used FROM quota_usage "
+            "GROUP BY actor, kind ORDER BY actor, kind")
         diagnostics = [{"kind": r["kind"], **json.loads(r["detail_json"])}
                        for r in self.index.query(
                            "SELECT kind, detail_json FROM diagnostics "
