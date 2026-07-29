@@ -1,0 +1,244 @@
+# CANDOR — agent interface guide (LLM.txt)
+
+This file is written for an AI agent (or its developer) that needs to use
+CANDOR correctly without reading the whole codebase. It is self-contained;
+pointers to deeper docs and runnable examples are at the end.
+
+## What this is
+
+CANDOR is a **memory substrate for agents that knows why it believes things**.
+It is not a vector store. Text similarity never moves a number here. Instead:
+
+- Every belief traces to attributed evidence in an append-only, hash-chained
+  ledger. `why(fact_id)` returns the whole chain.
+- Every probability is EARNED: composed from observed outcomes, per-source
+  trust learned from settled predictions, and auditable calibration.
+- Sources earn trust only by being right when predictions settle — never by
+  volume, never by agreeing.
+- Instability is treated as information: a flaky fact triggers a hunt for the
+  missing variable (including variables nobody logged), a one-way change gets
+  located to a date, and honest confusion becomes an open question that says
+  what to measure next.
+- Nothing is ever mutated. Change = append + recompute. Delete the SQLite
+  index and `replay()` rebuilds it bit-for-bit from the log.
+
+Use it when your agent accumulates operational beliefs (tool health, source
+quality, environment behavior, judge verdicts) and you need those beliefs to
+be auditable, revisable, and honestly uncertain. Do NOT use it as a semantic
+search index, a distributed database, or a query-time oracle that must beat a
+frontier model reading full evidence fresh (docs/use-cases.md lists the
+anti-use-cases; docs/benchmarks.md shows the honest losses too).
+
+## Setup
+
+Python 3.11+, zero runtime dependencies (stdlib only).
+
+    import sys; sys.path.insert(0, "src")     # or install the package
+    from candor.system import CandorSystem
+    m = CandorSystem("./store")               # a directory; created if absent
+    ...
+    m.close()
+
+Everything below is a method on `m`. All writes append ledger events; all
+reads are pure. A statement (`stmt`) is always a dict:
+`{"pred": "fetch_ok", "args": ["site.com"]}` (+ `"stmt_type"` when asserting).
+
+## The core loop (memorize this shape)
+
+    # 1. PROPOSE — nothing becomes a fact by assertion; a 7-step gate decides
+    m.assert_({"pred": "fetch_ok", "args": ["site"], "stmt_type": "frequency"},
+              source="runbook", actor="human:operator")
+    m.run_gate()                               # sweep + drain candidates
+
+    # 2. OBSERVE — attributed, context-rich outcome reports. LOG WIDE:
+    #    ambient context is how missing variables get found later.
+    m.observe({"pred": "fetch_ok", "args": ["site"]}, outcome=True,
+              ctx={"method": "crawl4ai", "region": "eu"}, actor="tool:probe")
+
+    # 3. PREDICT — a real probability with an interval and a snapshot id
+    p = m.predict({"pred": "fetch_ok", "args": ["site"]}, budget=10_000)
+    p.p, p.ci, p.caveats, p.snapshot_id
+
+    # 4. SETTLE — the ONLY way trust moves: claim, then resolve against reality
+    cid = m.claim(stmt, frame="external", criterion="verifier:ci", due=0)
+    m.resolve(cid, outcome=True)
+
+    # 5. MAINTAIN — run_gate() periodically: it re-sweeps for new structure
+    #    AND audits admitted conditions against post-admission evidence.
+
+## Statement types (choose at assert_ time; it decides what observe means)
+
+| stmt_type     | Meaning                       | observe with        | predict returns |
+|---------------|-------------------------------|---------------------|-----------------|
+| `crisp`       | "X is true" (belief)          | `outcome=True/False`| PredictOutcome  |
+| `frequency`   | "X happens at some rate"      | `outcome=True/False`| PredictOutcome  |
+| `categorical` | "X takes one of an OPEN set"  | `value="captcha"`   | CategoricalPrediction |
+
+Categorical vocabularies grow as new values appear, and the prediction always
+reserves a first-class **unknown** mass for a never-seen value — a new failure
+mode is a real probability, not zero. Continuous scalars (latencies, scores)
+have no native channel: bucket or threshold them at the boundary.
+
+## Context (`ctx`) conventions — read carefully
+
+`ctx` is free-form `{str: str}`. Two prefixes are RESERVED:
+
+- **`do:`** — you were ACTING on the world, not watching it (an intervention:
+  targeting a metric, forcing a route, changing a policy). Same statistics,
+  different semantics: a condition discovered on a `do:` key is labeled
+  regime dependence (P(·|observe) ≠ P(·|do)), and any prediction pooling
+  observations across mixed `do:` regimes carries a `regime_mixed` caveat.
+  If your agent both monitors and optimizes something, log the optimization
+  as `ctx={"do:optimize_metric": "yes"}` — that is how a Goodhart collapse
+  gets found BY NAME instead of read as noise.
+- **`derived:`** — never write these. The sweep synthesizes them itself:
+  `derived:hour` / `derived:dow` (UTC, from event timestamps), `derived:prev`
+  (the fact's previous outcome), `derived:{k1}x{k2}` (interactions of your
+  recorded keys). This means structure like "backups fail at 03:00" is
+  findable even when you logged NOTHING — but recorded context always
+  outranks synthesized frames, so logging wide remains the best strategy.
+
+For historical backfill, pass the real event time: `observe(..., ts=<ms
+epoch>)` — located regime-change dates and quota epochs come from it.
+
+## Reading the outputs
+
+`PredictOutcome`: `p` (calibrated), `ci` (5–95% credible interval),
+`channels` (epistemic vs aleatoric spread), `sensitivity` (which fact flips
+the conclusion), `mpe`, `caveats` (see vocabulary below), `snapshot_id`
+(feed to `predict_at(stmt, snapshot_id)` to reproduce the number bit-for-bit,
+forever), `rejection_rate` (constraint tension between admitted facts).
+
+`CategoricalPrediction`: `values` ({value: slice with `.p` and `.ci`}),
+`unknown` (the never-seen mass, own slice), `total_observations`,
+`snapshot_id`, `caveats`, `by_context` (distribution conditioned on any
+discovered guard key, each group with its own unknown slice).
+
+**Caveat vocabulary — what to DO when you see one:**
+
+| caveat | Meaning | Agent action |
+|---|---|---|
+| `under_specified` | The fact is dispersed; a missing variable is suspected | call `distribution(stmt)`; check `questions()` for the suggested measurement |
+| `unstable` | Vote sequence alternates (flaky) | don't trust the point estimate; inspect `distribution(stmt)` modes |
+| `narrow_breadth` | Confirming evidence spans little context diversity | treat as weakly transferable; observe under varied context |
+| `shared_provenance` | Multiple proof facts trace to one source | corroborate independently before acting |
+| `regime_mixed` | The number pools across a `do:` intervention boundary | use `distribution(stmt)` per-regime numbers; do not act on the marginal |
+| `no_observations` | Admitted but never observed (categorical) | everything is unknown mass; observe first |
+| `constraint_tension` | Every sampled world violated a constraint | the store holds contradictory beliefs; inspect and repair |
+
+`distribution(stmt)` (binary facts, pure read): `modes` (true-rate per
+recorded ctx key incl. a `__residual__` bucket), `derived_modes` (same for
+synthesized frames), `residual.conditioning_key/explained/unexplained` (η² of
+the admitted guard vs the honest unexplained share).
+
+`questions(scope="*")`: open anomalies, each with a residual partition and a
+concrete `suggested_measurement` — these are experiments the store is asking
+you to run. Feed the answers back as observations with wider ctx.
+
+`why(obj_id)`: full audit for a fact — per-actor counts, gate run, spans,
+derivation and its quality. `health()`: calibration report, quota status.
+`events_since(cursor, kinds)`: the ledger as an outbox for consumers.
+
+## The life of a discovered condition (guard)
+
+1. Instability detected (overdispersion across ctx keys, incl. derived ones).
+2. A guard is proposed: "true when key=value" — it must survive BH correction,
+   an MDL check, per-side support floors, and a held-out validation quarter.
+3. Admitted → it conditions read-time surfacing (`distribution`,
+   `by_context`) and flags predictions. It does NOT silently change `p`.
+4. **It must keep paying rent**: every `run_gate()` scores it on observations
+   that arrived after admission. Direction reversed (with hysteresis) or
+   stale (null on twice the entry evidence) → DEMOTED through the ledger;
+   you'll see `status: "demoted"` in `run_gate()`'s return.
+5. Re-entry needs fresh post-demotion evidence — a dead guard cannot ride its
+   own past back in, but a world that re-structures earns it back.
+
+A one-way change routes differently: a `supersede_valid_time` closes the old
+regime AT THE LOCATED DATE; old counts stay with the old regime. Oscillation
+routes to a condition or an open question, never to a supersede.
+
+## Analogy, carefully licensed (conjecture)
+
+    out = m.conjecture({"pred": "flies", "args": ["squirrel"]}, sim_budget=0.15)
+
+Proposes `flies(squirrel)` by analogy to a behaviorally similar predicate that
+already holds there. Read-only by default and NEVER a proof. With
+`commit=True` each proposal is filed as a claim by `agent:conjecture` whose
+predicted_p is the ANALOG's earned probability (similarity is a licence, not
+a probability); `resolve(claim_id, outcome=True)` then admits the goal as a
+fact — through the gate. The analogy engine's hit rate accumulates under its
+own calibration class (`conjecture/v1`), so you can check how much its
+analogies are worth before trusting them.
+
+## Repair surface (when something goes wrong)
+
+- **Bad source** → `retract_source("tool:x", reason=...)` — reversible
+  (`restore=True`); every downstream number recomputes as if it never spoke.
+  This is almost always what you want — NOT `redact`.
+- **Bad content (secrets/PII)** → `redact(payload_hash)` — but payloads are
+  content-addressed and shared across actors saying the same thing, so check
+  `redaction_scope(payload_hash)` first: redacting a liar's payload can
+  destroy honest agreeing reports.
+- **Discount, don't silence** → `set_reliability(actor, frame, a, b)`.
+- **Human override** → `pin(target_id, "+"/"-", reason, authority)`; a `-`
+  pin is the system's only hard zero. `supersede(target_id, reason)` reverses
+  structures by appending.
+- **Rebuild** → `replay()` returns the closure hash; deleting
+  `index.sqlite3` loses nothing. `checkpoint()` speeds up reopen.
+
+## Errors you may need to handle
+
+- `QuotaExceeded` — per-actor, per-epoch flood bound (default 3000 obs / 500
+  candidates per day). Provision bulk loads: `set_actor_quota(actor,
+  obs_per_epoch=..., cand_per_epoch=...)`.
+- `Unauthorized` — only if an authz policy was installed via `set_authz`;
+  by default `actor`/`authority` are attribution labels, not logins (the
+  trust boundary is the process — see SECURITY.md).
+- `claim()` returns the string `"Refused"` for unsettleable statements (no
+  constructible verifier). Check for it.
+- `KeyError` — `resolve()` on an unknown claim id; `predict_at()` with a
+  snapshot whose ledger head is not in this chain.
+
+## Rules of the road (things agents get wrong)
+
+1. `assert_` NEVER creates a fact — it creates a candidate; `run_gate()`
+   decides. Rejections are recorded with the failing step; read them.
+2. Trust never moves from observations alone — only from settled claims
+   through `resolve()`. Sources cannot promote themselves; neither can you,
+   except by being right.
+3. The sweep is batch-triggered: flags, guards, demotions, and
+   `closure_hash()` reflect the LAST `run_gate()`. Call `run_gate()` after
+   feeding observations and before comparing hashes across processes.
+4. `recall(query, budget)` is prose retrieval over the evidence tier — it is
+   firewalled and cannot move any number. Don't expect it to.
+5. Actor naming: use `class:name` — `human:alice`, `tool:probe`,
+   `agent:planner`, `verifier:ci`. The prefix sets the actor class.
+6. `derive(goal, budget)` is three-valued: `proof` / `not_entailed` (search
+   exhausted) / `budget_exceeded` (unknown — never conflate with absence).
+7. One writer, one box. Do not share a store directory between processes.
+
+## Runnable examples (offline, seconds each)
+
+- `examples/quickstart.py` — the core loop end to end.
+- `examples/source_reliability.py` — sycophant vs specialist: trust shapes.
+- `examples/regime_change.py` — condition vs located date vs open question.
+- `examples/categorical.py` — open vocabulary + the unknown mass.
+- `examples/axiom_loops.py` — v0.6: a frame the sweep synthesized itself, a
+  condition demoted for not paying rent, a conjecture that became a fact only
+  after settling true, and a Goodhart collapse found by name.
+
+## Deeper documentation
+
+- `README.md` — the claims, each one executable (`make claims`).
+- `docs/getting-started.md` — install, mental model, surprises-on-purpose.
+- `docs/api.md` — every call with examples.
+- `docs/architecture.md` — ledger, gate, trusted core vs untrusted periphery,
+  invariants, the curiosity engine.
+- `docs/use-cases.md` — five patterns + anti-use-cases.
+- `SPEC.md` + `docs/spec-v0.3..v0.6-delta.md` — the frozen spec and adopted
+  deltas; `DEVIATIONS.md` — every interpretive decision, numbered.
+- `SECURITY.md` — the trust boundary and what the hash chain does NOT prove.
+- `tests/claims/` — the README measured on planted synthetic worlds;
+  `tests/claims/test_axiom_battery.py` — the learnability battery (what this
+  system can originate, what it can only locate, and the negative control it
+  must decline).

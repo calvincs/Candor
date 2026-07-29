@@ -115,11 +115,21 @@ snapshot.
 
 A sweep over the observation log that treats instability as information:
 
-- **Overdispersion** (Tarone's Z, BH-corrected across recorded context keys)
+- **Overdispersion** (Tarone's Z, BH-corrected across the context keys tested)
   → a *guard* candidate ("true when key=value"), which must clear per-side
   support, an MDL check, and held-out validation at the gate. High-cardinality
   keys can flag a problem but can never become guards — an m-ary lookup table
   is not a condition.
+- **Derived frames** (v0.6 Δ10) — the keys tested are not limited to what the
+  agent logged. The sweep synthesizes candidate frames from data already in
+  the ledger — `derived:hour`/`derived:dow` from event timestamps,
+  `derived:prev` (the fact's own previous outcome), and pairwise interactions
+  of recorded keys — and runs the identical machinery over them. Recorded keys
+  outrank derived ones at winner selection, and `derived:prev` may only win
+  when it *absorbs* the time structure it claims to explain (a one-way step
+  routes to the located date instead; a residual block pattern routes to the
+  open question). Breadth stays recorded-only: synthesized diversity is not
+  logging diversity.
 - **One-way change** — located at the argmax of cumulative deviation (median
   error 1 observation in 120), then tested with a two-sided Fisher exact
   p-value corrected for the split positions searched, plus the same test inside
@@ -138,6 +148,20 @@ A sweep over the observation log that treats instability as information:
   logged* is told "log wider" instead of getting silence. When a new covariate
   starts being recorded later, open questions are re-tested against it
   automatically.
+- **The prospective audit** (v0.6 Δ11) — admission is not tenure. `run_gate()`
+  opens by scoring every admitted guard on the observations that arrived
+  *after* its admission, and demotes it through the ledger when its direction
+  reverses (§3.4 hysteresis, compared in evidence-nats) or goes stale on twice
+  the entry evidence. The demoted rule leaves the closure and every read path;
+  the memoryless sweep's re-proposal is then judged on *post-demotion*
+  evidence only, so a dead guard cannot flap back in on the history that
+  admitted it — but a world that re-structures can earn it back.
+- **Intervention labeling** (v0.6 Δ13) — context keys prefixed `do:` mark the
+  agent *acting* rather than watching. A guard on one is labeled regime
+  dependence (P(·|observe) ≠ P(·|do)) rather than a mere condition, and
+  predictions pooling across mixed `do:` regimes carry a `regime_mixed`
+  caveat. Vocabulary, deliberately not a causal model: nothing predicts what
+  an intervention will change before post-intervention data exists.
 
 **Timing and `closure_hash`.** The sweep is batch-triggered, not
 per-observation: `run_gate()` runs it, and a reopen re-runs it while folding.
@@ -149,13 +173,29 @@ alike. Live state equals replayed state *after* any `run_gate()` or reopen,
 which is exactly where the I3 equivalence is asserted; call `run_gate()` before
 comparing closure hashes across processes.
 
+## The conjecture loop (v0.6 Δ12)
+
+Soft unification proposes analogies over *behavioural* signatures (which rules
+a symbol fires in, what it co-derives with) — never text similarity, and never
+typed as a proof. v0.6 closes the loop that used to dead-end at the proposal:
+`conjecture(goal, sim_budget, commit=True)` files each analogy as a **claim**
+by `agent:conjecture`, whose predicted probability is the analog's own earned
+number transferred across the edge (similarity is a licence, not a
+probability). The claim calibrates under its own `conjecture/v1` predictor
+class — the analogy engine's track record is a measured curve, never pooled
+with the prediction engine's — and only a claim that *settles true* asserts
+the goal as a fact candidate, through the same gate as everything else.
+Postulate, validate, implement — in that order, never out of it.
+
 ## Spec lineage
 
 `SPEC.md` is the frozen v0.2 spec. [spec-v0.3-delta.md](spec-v0.3-delta.md)
 (two-coin trust, context-grouped composition, permanent control, dense
 retrieval as periphery input), [spec-v0.4-delta.md](spec-v0.4-delta.md)
-(graded observations, witness floor), and [spec-v0.5-delta.md](spec-v0.5-delta.md)
+(graded observations, witness floor), [spec-v0.5-delta.md](spec-v0.5-delta.md)
 (open-vocabulary categorical facts with a first-class unknown mass, read-time
-distribution surfacing) were adopted after pre-registered test rounds; each delta
-cites the evidence that forced it. `DEVIATIONS.md` records every interpretive
-decision.
+distribution surfacing), and [spec-v0.6-delta.md](spec-v0.6-delta.md) (derived
+context frames, the prospective guard audit, committed conjectures, `do:`
+intervention semantics — with the E→A boundary stated and tested) were adopted
+after pre-registered test rounds; each delta cites the evidence that forced it.
+`DEVIATIONS.md` records every interpretive decision.

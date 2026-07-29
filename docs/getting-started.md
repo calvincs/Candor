@@ -8,8 +8,8 @@ are needed only to run the test suite.
 ```sh
 make venv          # creates .venv and installs the test deps
 make gates         # stage1..stage5 conformance gates — should all be green
-make unit          # 443 additive unit tests
-make claims        # 35 claims tests: the README, measured on synthetic worlds
+make unit          # 474 additive unit tests
+make claims        # 41 claims tests: the README, measured on synthetic worlds
 ```
 
 `make claims-fast` skips the prediction-heavy tests (~45s instead of ~2m30s),
@@ -35,7 +35,11 @@ package) — there is nothing to compile and nothing to download.
    voted gets scored, which is the only way trust ever moves.
 5. The **curiosity engine** watches for facts that behave inconsistently and
    proposes repairs: a *condition* ("true when pressure is low") or a *regime
-   change* ("this stopped being true on April 30").
+   change* ("this stopped being true on April 30") — and it searches frames
+   you never logged (hour-of-day, the fact's own previous outcome, key
+   interactions) alongside the context you did. Admitted conditions are not
+   tenured: they keep being scored on later observations, and one that stops
+   earning its keep is demoted through the same gate that admitted it.
 
 ## A complete loop
 
@@ -73,8 +77,11 @@ m.close()
 
 Run `examples/quickstart.py` for this loop end to end,
 `examples/source_reliability.py` / `examples/regime_change.py` for the two
-signature behaviours, and `examples/categorical.py` for open-vocabulary
-categorical facts with a first-class unknown mass.
+signature behaviours, `examples/categorical.py` for open-vocabulary
+categorical facts with a first-class unknown mass, and
+`examples/axiom_loops.py` for the v0.6 loops: a frame the sweep synthesized
+itself, a condition demoted for not paying rent, a conjecture that became a
+fact only after settling true, and a Goodhart collapse found by name.
 
 ## Things that will surprise you (on purpose)
 
@@ -88,6 +95,16 @@ categorical facts with a first-class unknown mass.
   observations from a source leave its reliability untouched; only settled
   predictions score it. The world is allowed to surprise you; sources are not
   allowed to promote themselves.
+- **Two context prefixes are reserved.** Keys starting with `do:` mean the
+  agent was *acting on* the world (interventions) — a guard found on one is
+  labeled regime dependence and mixed-regime predictions carry a
+  `regime_mixed` caveat. Keys starting with `derived:` belong to the sweep's
+  synthesized frames and are never yours to write.
+- **Admitted conditions can be demoted.** A guard whose direction reverses on
+  post-admission data — or stops beating chance on twice the evidence that
+  admitted it — is removed through the ledger, and it only re-enters on fresh
+  post-demotion evidence. Watch for `status: "demoted"` entries in
+  `run_gate()`'s output.
 - **Deleting `index.sqlite3` loses nothing.** It is a derived view; `replay()`
   rebuilds it bit-for-bit from the ledger segments.
 - **To undo a bad source, use `retract_source`, not `redact`.** Payloads are

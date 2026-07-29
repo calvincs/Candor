@@ -85,6 +85,7 @@ print(p.p, p.ci, p.snapshot_id)   # a real probability, reproducible from its sn
 
 | Path | What it is |
 |---|---|
+| `LLM.txt` | The agent-facing interface guide — hand this file to an AI agent that needs to use the store correctly |
 | `SPEC.md` | The full v0.2 design spec — invariants, data model, test harness |
 | `docs/` | Architecture, API guide, use cases, benchmark story, spec deltas |
 | `examples/` | Runnable, offline demos of the main workflows |
