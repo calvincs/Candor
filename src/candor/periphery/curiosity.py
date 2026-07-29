@@ -12,6 +12,7 @@ into gate candidates is deliberately conservative until Stage 5 runs its gate.
 from __future__ import annotations
 
 import math
+import random
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Sequence
 
@@ -61,6 +62,74 @@ def tarone_z(groups: Sequence[Group]) -> Optional[float]:
     return (chi - total_n) / denom
 
 
+#: Draws for the deterministic parametric null of Tarone's Z. Enough to resolve
+#: the p-value at the BH / temporal thresholds it feeds (a few ×10⁻³). The null
+#: is only simulated for keys that clear the cheap normal screen below, so the
+#: sweep pays for it on the handful of promising covariates, not every one.
+TARONE_BOOTSTRAP = 2000
+
+#: Below this Z the normal tail already puts the p-value far above every
+#: threshold any caller compares against (≈0.16 at Z=1), so the exact null cannot
+#: change a decision and is not simulated.
+_TARONE_SCREEN_Z = 1.0
+
+
+def _null_seed(groups: Sequence[Group]) -> int:
+    """A deterministic, order-independent seed for the parametric null, so a
+    replay of the same observations reproduces the p-value bit-for-bit."""
+    seed = 0x9E3779B97F4A7C15
+    mask = (1 << 64) - 1
+    for n, k in sorted((g.n, g.k) for g in groups):
+        seed = ((seed ^ n) * 0x100000001B3) & mask
+        seed = ((seed ^ k) * 0x100000001B3) & mask
+    return seed
+
+
+def tarone_pvalue(groups: Sequence[Group]) -> Optional[float]:
+    """Upper-tail p-value for Tarone's overdispersion Z, calibrated in the far
+    tail. None exactly when tarone_z is None.
+
+    The Z statistic is standardized to mean 0 / unit variance, but its null
+    distribution is a right-skewed sum of squared binomial deviations, not a
+    Gaussian: reading the tail off ``0.5*erfc(z/sqrt2)`` is anti-conservative —
+    measured ~3-5x at p≈1e-3 and ~1.6x at alpha/6, exactly where a BH rank-1
+    threshold across several covariate keys bites and inflates the per-stream
+    false-guard rate. So above a cheap normal screen the tail is read instead off
+    the statistic's OWN null distribution, simulated in place: draw the group
+    counts from the fitted homogeneous binomial (each nᵢ, at the pooled rate) and
+    count how often a null Z reaches the observed one.
+
+    A moment-matched gamma was tried first and rejected: matching only mean and
+    variance over-corrects (measured ~0.5x nominal at alpha/6) and drops a real
+    but weak covariate below the detection bar, whereas this parametric null
+    lands near nominal and leaves detection intact. Its RNG is seeded from the
+    observed group counts, so the sweep stays replay-stable — no unseeded
+    randomness — and the simulation runs only past the screen, so it does not
+    slow the sweep materially.
+    """
+    usable = [g for g in groups if g.n > 0]
+    if len(usable) < 2:
+        return None
+    total_n = sum(g.n for g in usable)
+    total_k = sum(g.k for g in usable)
+    p = total_k / total_n
+    if p <= 0.0 or p >= 1.0:
+        return None
+    z = tarone_z(usable)
+    if z is None:
+        return None
+    if z <= _TARONE_SCREEN_Z:
+        return 0.5 * math.erfc(z / math.sqrt(2)) if z > 0.0 else 1.0
+    ns = [g.n for g in usable]
+    rng = random.Random(_null_seed(usable))
+    at_least = 1                                     # +1: the observed table itself
+    for _ in range(TARONE_BOOTSTRAP):
+        zsim = tarone_z([Group(n, rng.binomialvariate(n, p)) for n in ns])
+        if zsim is not None and zsim >= z:
+            at_least += 1
+    return at_least / (TARONE_BOOTSTRAP + 1)
+
+
 def overdispersed(groups: Sequence[Group],
                   threshold: float = TARONE_Z_THRESHOLD) -> bool:
     z = tarone_z(groups)
@@ -78,6 +147,64 @@ def partition_by_key(observations: Iterable[tuple[dict[str, str], bool]],
         bucket[0] += 1
         bucket[1] += 1 if outcome else 0
     return {v: Group(n, k) for v, (n, k) in out.items()}
+
+
+#: The bucket name for observations that did NOT record a given context key — the
+#: honest "cannot attribute this to any value of the key" mass. A dunder so it can
+#: never collide with a real context value (values are plain strings).
+RESIDUAL_BUCKET = "__residual__"
+
+
+def outcome_breakdown(observations: Iterable[tuple[dict[str, str], bool]],
+                      key: str) -> dict[str, Group]:
+    """Per-value (n, k) tally for ONE recorded context key, plus a residual bucket.
+
+    Extends `partition_by_key` with a ``__residual__`` group: the observations
+    that did not record `key` at all — mass no value of the key can account for.
+    Deterministic and order-independent (integer count folds), so a replay of the
+    same observation set reproduces every (n, k) exactly.
+
+    General in the tallied *outcome*: it counts n and k where k sums a truthy
+    outcome, so a future categorical fact type reuses the identical shape to break
+    a chosen value's incidence down by context — only the meaning of "truthy"
+    changes, decided by the caller, not this helper. (No categorical support is
+    built here; the helper simply does not hard-block it.)
+    """
+    obs = list(observations)
+    groups = dict(partition_by_key(obs, key))
+    res_n = res_k = 0
+    for ctx, outcome in obs:
+        if key not in ctx:
+            res_n += 1
+            res_k += 1 if outcome else 0
+    if res_n:
+        groups[RESIDUAL_BUCKET] = Group(res_n, res_k)
+    return groups
+
+
+def explained_fraction(groups: Iterable[Group]) -> float:
+    """Correlation ratio η² — the share of a binary outcome's total variance a
+    categorical partition accounts for: between-group variance / total variance.
+
+    A simple, standard, deterministic decomposition over the SAME Group(n, k)
+    partitions the dispersion machinery already builds — NOT a new detector. It is
+    0 when a partition separates the outcome no better than chance (every group at
+    the pooled rate) and approaches 1 as the groups become internally homogeneous,
+    so `1 - explained_fraction` is the honest "no recorded variable accounts for
+    this" residual. A degenerate outcome (all-0 or all-1, zero total variance)
+    yields 0. Order-independent up to float reassociation; pass groups in a stable
+    order (e.g. sorted by value) for a bit-reproducible result.
+    """
+    usable = [g for g in groups if g.n > 0]
+    total_n = sum(g.n for g in usable)
+    if total_n == 0:
+        return 0.0
+    p = sum(g.k for g in usable) / total_n
+    total_var = p * (1.0 - p)
+    if total_var <= 0.0:
+        return 0.0
+    between = sum(g.n * ((g.k / g.n) - p) ** 2 for g in usable) / total_n
+    return min(1.0, between / total_var)
 
 
 def cusum_changepoint(series: Sequence[bool], threshold: float = CUSUM_THRESHOLD,
@@ -232,7 +359,10 @@ def temporal_dispersion(series: Sequence[bool], alpha: float = BH_ALPHA
         z = tarone_z(blocks)
         if z is None or z <= 0.0:
             continue
-        pvalue = min(1.0, 0.5 * math.erfc(z / math.sqrt(2)) * len(scales))
+        p = tarone_pvalue(blocks)
+        if p is None:
+            continue
+        pvalue = min(1.0, p * len(scales))
         if pvalue <= alpha and (best is None or pvalue < best[0]):
             best = (pvalue, size, blocks)
     return best

@@ -17,25 +17,42 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+try:
+    import fcntl  # POSIX advisory file locks; auto-released on process exit.
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None  # type: ignore[assignment]
+
 from .hashing import GENESIS, canon_json, hash_obj, sha256_hex
 
 SEGMENT_LINES = 4096
 
+# A CAS key is exactly a lowercase sha256 hex digest (what hash_obj produces).
+# Anything else must never be interpolated into `cas_dir / f"{h}.json"`: a value
+# containing `..` would escape the payload directory (M4 path traversal).
+_PAYLOAD_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def is_payload_hash(value: Any) -> bool:
+    return isinstance(value, str) and _PAYLOAD_HASH_RE.match(value) is not None
+
 # Kinds admitted to the chain (spec §2 `events.kind` CHECK constraint).
 EVENT_KINDS = frozenset({
     "assertion", "observation", "supersede", "admission", "demotion",
-    "pin", "claim", "resolution", "alias", "redaction", "retraction", "checkpoint",
+    "pin", "claim", "resolution", "alias", "redaction", "retraction",
+    "checkpoint", "reliability",
 })
 
 # §3.1 durability: structural events fsync immediately, observations may batch.
+# A reliability override is an operator lever on committed numbers — durable.
 DURABLE_KINDS = frozenset({
     "admission", "resolution", "pin", "supersede", "alias", "redaction",
-    "retraction", "checkpoint",
+    "retraction", "checkpoint", "reliability",
 })
 
 
@@ -87,12 +104,52 @@ class Ledger:
         self._fh = None
         self._fh_path: Optional[Path] = None
         self._lines_in_seg = 0
+        self._lock_fh = None
+        # Cache the tail segment so append() never globs the directory. It is
+        # authoritative only because §7 guarantees a single writer; it is
+        # rebuilt from disk in _recover(), reset in destroy(), and advanced on
+        # rollover in _open_tail(). Nothing else changes segment structure.
+        self._tail_path: Optional[Path] = None
+
+    # ── writer lock (§7 single writer) ────────────────────────────────────────
+    def _acquire_lock(self) -> None:
+        """Take an exclusive advisory lock so a second live writer on this root
+        can't silently fork the chain (M1). flock auto-releases on process exit,
+        so a crash leaves no stale lock. On non-POSIX we degrade to no lock."""
+        if fcntl is None or self._lock_fh is not None:
+            return
+        lock_path = self.root / ".writer.lock"
+        lock_fh = lock_path.open("w")
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lock_fh.close()
+            raise LedgerError(
+                f"ledger root {self.root} is already locked by a live writer; "
+                f"refusing to open a second writer that would fork the chain")
+        self._lock_fh = lock_fh
+
+    def _release_lock(self) -> None:
+        if self._lock_fh is None:
+            return
+        try:
+            if fcntl is not None:
+                fcntl.flock(self._lock_fh.fileno(), fcntl.LOCK_UN)
+        except OSError:  # pragma: no cover - best effort; close() still frees it
+            pass
+        self._lock_fh.close()
+        self._lock_fh = None
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     def open(self) -> None:
         self.seg_dir.mkdir(parents=True, exist_ok=True)
         self.cas_dir.mkdir(parents=True, exist_ok=True)
-        self._recover()
+        self._acquire_lock()
+        try:
+            self._recover()
+        except Exception:
+            self._release_lock()
+            raise
 
     def close(self) -> None:
         if self._fh is not None:
@@ -100,6 +157,7 @@ class Ledger:
             self._fh.close()
             self._fh = None
             self._fh_path = None
+        self._release_lock()
 
     def destroy(self) -> None:
         """Wipe the store completely (test-only reset path)."""
@@ -109,6 +167,7 @@ class Ledger:
                 for p in sorted(d.iterdir()):
                     p.unlink()
         self._head, self._seq, self._lines_in_seg = GENESIS, 0, 0
+        self._tail_path = None
 
     # ── recovery (§3.1 torn-write) ───────────────────────────────────────────
     def _segments(self) -> list[Path]:
@@ -157,23 +216,34 @@ class Ledger:
                     seg.write_bytes(bytes(keep))
                 else:
                     seg.unlink()
+            elif bytes(keep) != raw:
+                # H5: the segment verifies but was not byte-identical to what we
+                # will keep — e.g. the last line lost only its trailing "\n".
+                # Persist the normalized bytes so the last line always ends in
+                # "\n"; otherwise the next append() merges onto it and the chain
+                # can no longer be parsed.
+                seg.write_bytes(bytes(keep))
         self._head = prev
         self._seq = seq
         self._lines_in_seg = 0
         segs = self._segments()
+        self._tail_path = segs[-1] if segs else None
         if segs:
             self._lines_in_seg = sum(1 for _ in segs[-1].open("rb"))
 
     # ── append ───────────────────────────────────────────────────────────────
     def _open_tail(self):
-        segs = self._segments()
-        if not segs or self._lines_in_seg >= SEGMENT_LINES:
-            idx = (int(segs[-1].stem) + 1) if segs else 1
+        # The tail path is cached (_recover rebuilds it from disk); rollover is
+        # the only steady-state event that changes it, so append() no longer
+        # globs the segments directory on every call.
+        if self._tail_path is None or self._lines_in_seg >= SEGMENT_LINES:
+            idx = (int(self._tail_path.stem) + 1) if self._tail_path is not None else 1
             path = self.seg_dir / f"{idx:06d}.jsonl"
             path.touch()
             self._lines_in_seg = 0
+            self._tail_path = path
         else:
-            path = segs[-1]
+            path = self._tail_path
         if self._fh_path != path:
             if self._fh is not None:
                 self._fh.flush()
@@ -247,12 +317,20 @@ class Ledger:
                                 rec["context_sig"], rec["prev_hash"], rec["hash"])
 
     def payload(self, payload_hash: str) -> Optional[Any]:
+        # Refuse to interpolate anything but a real digest into the CAS path
+        # (M4): a non-hash cannot name a stored payload anyway, so a safe no-op.
+        if not is_payload_hash(payload_hash):
+            return None
         path = self.cas_dir / f"{payload_hash}.json"
         if not path.exists():
             return None
         return json.loads(path.read_text(encoding="utf-8"))
 
     def delete_payload(self, payload_hash: str) -> bool:
+        # Defense in depth (M4): never unlink a path built from a non-digest,
+        # which could contain `..` and escape cas_dir. A no-op, cannot escape.
+        if not is_payload_hash(payload_hash):
+            return False
         path = self.cas_dir / f"{payload_hash}.json"
         if path.exists():
             path.unlink()
@@ -261,19 +339,28 @@ class Ledger:
 
     def verify_chain(self) -> bool:
         prev, seq = GENESIS, 0
-        for ev in self.read_all():
-            if ev.prev_hash != prev or ev.seq != seq + 1:
-                return False
-            if ev.hash != _event_hash(ev.seq, ev.ts, ev.kind, ev.actor,
-                                      ev.payload_hash, ev.source_ref,
-                                      ev.context_sig, ev.prev_hash):
-                return False
-            prev, seq = ev.hash, ev.seq
+        # H5: a corrupt/unparseable/garbage tail must yield False, never raise.
+        # read_all() parses lines lazily, so wrap the whole traversal.
+        try:
+            for ev in self.read_all():
+                if ev.prev_hash != prev or ev.seq != seq + 1:
+                    return False
+                if ev.hash != _event_hash(ev.seq, ev.ts, ev.kind, ev.actor,
+                                          ev.payload_hash, ev.source_ref,
+                                          ev.context_sig, ev.prev_hash):
+                    return False
+                prev, seq = ev.hash, ev.seq
+        except Exception:
+            return False
         return prev == self._head
 
     # ── test-only fault injection support (§6.1) ─────────────────────────────
     def append_raw_line(self, text: str) -> None:
-        """Write an unverifiable line to the tail segment (torn-write simulation)."""
+        """Write an unverifiable line to the tail segment (torn-write simulation).
+
+        A torn write is what a *crashed* writer leaves behind, and a crash frees
+        the process's flock. Model that here by releasing the writer lock too, so
+        a fresh recovery writer can open the same root (M1)."""
         fh = self._open_tail()
         fh.write(text.encode("utf-8"))
         fh.flush()
@@ -281,3 +368,4 @@ class Ledger:
         self._fh.close()
         self._fh = None
         self._fh_path = None
+        self._release_lock()

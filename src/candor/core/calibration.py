@@ -23,6 +23,10 @@ N_BUCKETS = 10
 MIN_N_FOR_ALERT = 50          # §2: alerting requires n >= min_n per bucket
 ENGINE_VERSION = "candor-engine/0.2.0"
 DEFAULT_PREDICTOR_CLASS = "wmc-two-loop/v1"
+# The categorical leaf-query path is a DISTINCT predictor class so its
+# predictions never pool with the scalar wmc-two-loop path (I9) — a categorical
+# prediction is a distribution over an open vocabulary, not a scalar p.
+CATEGORICAL_PREDICTOR_CLASS = "categorical/v1"
 
 
 def bucket_of(p: float) -> int:
@@ -74,9 +78,21 @@ def fit_isotonic(pairs: Sequence[tuple[float, int]]) -> IsotonicMap:
     if not pairs:
         return IsotonicMap()
     ordered = sorted(pairs, key=lambda t: t[0])
-    blocks: list[list[float]] = []  # [sum_y, count, sum_x]
+    # Pool tied x into ONE block BEFORE PAVA: `sorted` is stable, so equal-x
+    # points otherwise keep their input order and PAVA merges them differently
+    # depending on it — and predict() emits multiples of 1/512, so tied x is the
+    # norm. Pooling first makes the fit a function of the input multiset, not the
+    # order settled claims happened to be enumerated in (M7).
+    pooled: list[list[float]] = []  # [sum_y, count, x] — one entry per distinct x
     for x, y in ordered:
-        blocks.append([float(y), 1.0, float(x)])
+        if pooled and pooled[-1][2] == float(x):
+            pooled[-1][0] += float(y)
+            pooled[-1][1] += 1.0
+        else:
+            pooled.append([float(y), 1.0, float(x)])
+    blocks: list[list[float]] = []  # [sum_y, count, sum_x]
+    for sum_y, count, x in pooled:
+        blocks.append([sum_y, count, x * count])
         while len(blocks) >= 2 and blocks[-2][0] / blocks[-2][1] > blocks[-1][0] / blocks[-1][1]:
             b = blocks.pop()
             a = blocks.pop()
@@ -145,6 +161,19 @@ def snapshot_id(ledger_head: str, calib_map_hash: str,
     """I8: {ledger head hash, engine version, calibration map hash}, decodable."""
     return canon_json({"ledger_head": ledger_head, "engine_version": engine_version,
                        "calib_map_hash": calib_map_hash})
+
+
+def categorical_snapshot_id(ledger_head: str, calib_map_hash: str,
+                            alpha: float) -> str:
+    """I8 for the categorical leaf-query path (design §5). The CRP concentration
+    `alpha` is a read-time constant (like GAMMA / the epi priors): it never lives
+    in storage, so it must ride in the ENGINE VERSION or a re-tuned alpha would
+    silently reproduce a DIFFERENT distribution under the SAME snapshot id.
+    Folding it in (and the distinct predictor_class) means changing alpha changes
+    every categorical snapshot id, exactly the discipline the isotonic-map hash
+    already enforces for the scalar path."""
+    engine = f"{ENGINE_VERSION}+{CATEGORICAL_PREDICTOR_CLASS}(alpha={alpha!r})"
+    return snapshot_id(ledger_head, calib_map_hash, engine_version=engine)
 
 
 def parse_snapshot(snapshot: str) -> dict[str, str]:

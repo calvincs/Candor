@@ -23,6 +23,55 @@ from . import curiosity as C
 MIN_OBS = 16
 
 
+def _avalanche(x: int) -> int:
+    """SplitMix64 finalizer: a deterministic, replay-stable 64-bit hash whose
+    output bits are decorrelated from the input's low-order structure."""
+    mask = (1 << 64) - 1
+    x &= mask
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & mask
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & mask
+    return x ^ (x >> 31)
+
+
+#: One in every DISCOVERY_STRIDE observations (in hash-shuffled order) is routed
+#: to the held-out VALIDATION set; the rest drive DISCOVERY. Not one-half: a
+#: 50/50 split halves the effective sample on each side, which (i) drops a weak
+#: but real covariate (0.70 vs 0.40 success) below the detection bar and (ii)
+#: pushes a two-value partition below the gate's 8-per-side support floor on
+#: short streams. A 3:1 split keeps discovery powerful and every partition clear
+#: of the floor while leaving a validation quarter large enough to reject a
+#: mis-selected direction.
+DISCOVERY_STRIDE = 4
+
+
+def discovery_mask(seqs: "list[int]") -> list[bool]:
+    """A deterministic discovery/validation split aligned with `seqs`: True marks
+    a discovery observation, False a held-out validation one.
+
+    The split is *systematic* over a hash-shuffled order — sort the observations
+    by a hash of their immutable event_seq, then hand every DISCOVERY_STRIDE-th
+    one to validation. That buys three properties a plain positional even/odd
+    split lacks:
+
+    * Decorrelation. A covariate recorded as ``value[i % 2]`` — an alternating
+      method, a flip-flopping route — aliases exactly with index parity, so an
+      'even-indexed' discovery set would see only one covariate value and no
+      contrast at all. Sorting by a hash of the event_seq breaks that aliasing.
+    * Balance. Systematic sampling of the shuffled order splits every covariate
+      value into discovery/validation with far lower allocation variance than
+      independent per-observation hashing, which matters when a covariate is
+      recorded on only a few dozen observations (the direction stays estimable).
+    * Replay-stability. Keyed on the immutable event_seq, the split is
+      bit-for-bit reproducible on replay.
+    """
+    order = sorted(range(len(seqs)), key=lambda i: (_avalanche(seqs[i]), seqs[i]))
+    mask = [True] * len(seqs)
+    for rank, i in enumerate(order):
+        if rank % DISCOVERY_STRIDE == DISCOVERY_STRIDE - 1:
+            mask[i] = False
+    return mask
+
+
 def _mdl_fields(groups: dict[str, C.Group]) -> dict[str, float]:
     pooled = [C.Group(sum(g.n for g in groups.values()),
                       sum(g.k for g in groups.values()))]
@@ -32,7 +81,13 @@ def _mdl_fields(groups: dict[str, C.Group]) -> dict[str, float]:
 
 
 def sweep(idx) -> list[tuple[str, dict[str, Any]]]:
-    """Return (candidate_kind, body) proposals; also set flags/questions."""
+    """FULL sweep: (re)derive every fact's verdict from its own observations.
+
+    Returns (candidate_kind, body) proposals; also sets each fact's dispersion
+    flag / breadth / open question. A fact's verdict is a pure function of that
+    fact's OWN observations and context (nothing here reads across facts), which
+    is exactly what lets `resweep` re-derive one fact in isolation and match this.
+    """
     proposals: list[tuple[str, dict[str, Any]]] = []
     # The sweep is a memoryless detector over the raw observation log: a
     # persisting pattern is re-proposed every sweep (gate application is
@@ -42,12 +97,55 @@ def sweep(idx) -> list[tuple[str, dict[str, Any]]]:
         "SELECT f.id, f.pred, f.args_json, f.stmt_type FROM facts f "
         "ORDER BY f.id")
     for fact in facts:
-        rows = idx.query(
-            "SELECT o.event_seq, o.outcome, e.ts FROM observations o "
-            "JOIN events e ON e.seq = o.event_seq WHERE o.fact_id=? "
-            "ORDER BY o.event_seq", (fact["id"],))
-        if len(rows) < MIN_OBS:
+        proposals.extend(_sweep_fact(idx, fact))
+    return proposals
+
+
+def resweep(idx, fact_ids) -> list[tuple[str, dict[str, Any]]]:
+    """INCREMENTAL sweep: re-derive ONLY the given facts' verdicts (H6b).
+
+    On the checkpoint fast path the restored snapshot is POST-sweep, so a fact's
+    verdict is already correct UNLESS the folded tail added an observation to it.
+    Re-deriving just those tail-touched facts — each from its FULL observation set
+    — is byte-identical to a full sweep for them (a verdict depends only on the
+    fact's own observations), while untouched facts keep their snapshot verdict.
+    O(touched), not O(all facts).
+
+    Because a re-derivation must be able to DOWNGRADE a fact (the sweep only ever
+    SETS dispersion_flag and always (re)writes breadth), each fact's prior verdict
+    is wiped first, then recomputed. On a from-scratch full replay the same facts
+    start blank, so `sweep` needs no such wipe and stays byte-for-byte as before.
+    """
+    proposals: list[tuple[str, dict[str, Any]]] = []
+    for fid in fact_ids:
+        fact = idx.one(
+            "SELECT id, pred, args_json, stmt_type FROM facts WHERE id=?", (fid,))
+        if fact is None:
             continue
+        idx.execute(
+            "UPDATE facts SET dispersion_flag=0, breadth_class=NULL WHERE id=?",
+            (fid,))
+        idx.execute(
+            "DELETE FROM open_questions WHERE kind='dispersion' AND target_id=?",
+            (fid,))
+        proposals.extend(_sweep_fact(idx, fact))
+    return proposals
+
+
+def _sweep_fact(idx, fact) -> list[tuple[str, dict[str, Any]]]:
+    """Derive one fact's verdict from its full observation set. Pure in the
+    fact's own observations/context — the unit shared by `sweep` and `resweep`."""
+    if fact["stmt_type"] == "categorical":
+        # A categorical fact carries no boolean outcome, so the binomial sweep
+        # below does not apply; it is swept per-value one-vs-rest (C4, design §7).
+        # Kept a disjoint branch so the crisp/frequency path stays byte-identical.
+        return _sweep_categorical_fact(idx, fact)
+    proposals: list[tuple[str, dict[str, Any]]] = []
+    rows = idx.query(
+        "SELECT o.event_seq, o.outcome, e.ts FROM observations o "
+        "JOIN events e ON e.seq = o.event_seq WHERE o.fact_id=? "
+        "ORDER BY o.event_seq", (fact["id"],))
+    if len(rows) >= MIN_OBS:
         series = [bool(r["outcome"]) for r in rows]
         ctx_rows = idx.query(
             "SELECT oc.event_seq, oc.key, oc.value FROM obs_context oc "
@@ -60,13 +158,24 @@ def sweep(idx) -> list[tuple[str, dict[str, Any]]]:
                for r in rows]
         keys = sorted({k for ctx, _ in obs for k in ctx})
 
+        # §3.4 step 5: a GENUINE discovery/validation split. Every discovery
+        # statistic below (Tarone / BH / MDL / direction) is computed on the
+        # discovery observations only; the hits/misses handed to the gate come
+        # from the disjoint, untouched validation quarter. Otherwise the gate's
+        # held-out check (gate.py rejects on hits <= misses) runs on data that
+        # already drove the selection, which is no check at all (M8).
+        seqs = [int(r["event_seq"]) for r in rows]
+        disc = discovery_mask(seqs)
+        disc_obs = [o for o, d in zip(obs, disc) if d]
+        val_obs = [o for o, d in zip(obs, disc) if not d]
+
         # covariate search: Tarone per key, BH across the keys tested (§4.5).
         # A key whose cardinality exceeds n/(2*min_support) cannot yield a
         # guard — an m-ary split at that granularity is a lookup table, not a
         # condition — but it still licenses DETECTION (flag + open question).
         tested: list[tuple[str, dict[str, C.Group], float, bool]] = []
         for key in keys:
-            groups = C.partition_by_key(obs, key)
+            groups = C.partition_by_key(disc_obs, key)
             usable = {v: g for v, g in groups.items()
                       if g.n >= C.MIN_SUPPORT_PER_PARTITION}
             if len(usable) < 2:
@@ -74,9 +183,14 @@ def sweep(idx) -> list[tuple[str, dict[str, Any]]]:
             z = C.tarone_z(list(usable.values()))
             if z is None:
                 continue
-            pvalue = 0.5 * math.erfc(z / math.sqrt(2)) if z > 0 else 1.0
+            # M9: a far-tail-calibrated p-value, not the anti-conservative normal
+            # approximation, so the BH threshold this feeds holds its nominal
+            # false-guard rate out where alpha/m bites.
+            pvalue = C.tarone_pvalue(list(usable.values()))
+            if pvalue is None:
+                continue
             guardable = len(groups) <= max(
-                2, len(obs) // (2 * C.MIN_SUPPORT_PER_PARTITION))
+                2, len(disc_obs) // (2 * C.MIN_SUPPORT_PER_PARTITION))
             tested.append((key, usable, pvalue, guardable))
         keep = C.benjamini_hochberg([t[2] for t in tested]) if tested else []
         winner = None
@@ -101,11 +215,12 @@ def sweep(idx) -> list[tuple[str, dict[str, Any]]]:
         if winner is not None:
             key, usable, mdl = winner
             best = max(usable, key=lambda v: usable[v].k / max(1, usable[v].n))
-            # §3.4 step 5: validate on held-out observations, not the discovery
-            # set — even-indexed obs discover, odd-indexed validate direction.
+            # The guard and its direction were chosen on the discovery
+            # observations; the hits/misses the gate weighs are scored on the
+            # disjoint validation set, which no discovery statistic touched (M8).
             hits = misses = 0
-            for i, (ctx, out) in enumerate(obs):
-                if i % 2 == 0 or key not in ctx:
+            for ctx, out in val_obs:
+                if key not in ctx:
                     continue
                 predicted = ctx[key] == best
                 if predicted == out:
@@ -170,6 +285,122 @@ def sweep(idx) -> list[tuple[str, dict[str, Any]]]:
         report = C.breadth_report(confirming)
         idx.execute("UPDATE facts SET breadth_class=? WHERE id=?",
                     (report["breadth_class"], fact["id"]))
+    return proposals
+
+
+def _sweep_categorical_fact(idx, fact) -> list[tuple[str, dict[str, Any]]]:
+    """Per-value ONE-VS-REST sweep for a categorical fact (C4, design §7 — LOCKED).
+
+    For each observed value ``v`` the categorical observation series is projected
+    to the binary series ``[value == v]`` and the EXISTING covariate machinery —
+    ``partition_by_key → tarone_z → tarone_pvalue → BH → MDL → held-out → guard``
+    — runs UNCHANGED on each projection. So "value==captcha is overdispersed on
+    region, and captcha concentrates in region=eu" surfaces as a guard on
+    ``region=eu`` proposed through the same gate flow.
+
+    Benjamini–Hochberg corrects across the FULL K-values × keys comparison set
+    together (design §7's multiple-comparison note), so the per-value multiplicity
+    does not inflate the false-guard rate. Like the binary sweep this is a PURE
+    function of the fact's OWN observations (the resweep purity contract), so the
+    categorical verdict replays / checkpoints bit-for-bit (I3/I8).
+
+    Deferred to the joint-multinomial successor (design §7): a single G-test of
+    independence over the value × context table (no K-way tax) and per-value
+    changepoint→supersede on the time axis. v1 ships one-vs-rest guards + breadth.
+    """
+    proposals: list[tuple[str, dict[str, Any]]] = []
+    rows = idx.query(
+        "SELECT o.event_seq, o.value FROM observations o "
+        "WHERE o.fact_id=? AND o.value IS NOT NULL ORDER BY o.event_seq",
+        (fact["id"],))
+    if len(rows) < MIN_OBS:
+        return proposals
+    ctx_rows = idx.query(
+        "SELECT oc.event_seq, oc.key, oc.value FROM obs_context oc "
+        "JOIN observations o ON o.event_seq = oc.event_seq "
+        "WHERE o.fact_id=?", (fact["id"],))
+    by_seq: dict[int, dict[str, str]] = {}
+    for r in ctx_rows:
+        by_seq.setdefault(int(r["event_seq"]), {})[r["key"]] = r["value"]
+    cat_obs = [(by_seq.get(int(r["event_seq"]), {}), r["value"]) for r in rows]
+    keys = sorted({k for ctx, _ in cat_obs for k in ctx})
+    values = sorted({v for _, v in cat_obs})
+
+    # Same held-out discovery/validation split as the binary sweep (M8): keyed on
+    # the immutable event_seq, so it is shared across every per-value projection.
+    seqs = [int(r["event_seq"]) for r in rows]
+    disc = discovery_mask(seqs)
+    disc_obs = [o for o, d in zip(cat_obs, disc) if d]
+    val_obs = [o for o, d in zip(cat_obs, disc) if not d]
+
+    # Tarone per (value, key) on the one-vs-rest projection; BH across ALL of them.
+    tested: list[tuple[str, str, dict[str, C.Group], float, bool]] = []
+    for value in values:
+        proj = [(ctx, ov == value) for ctx, ov in disc_obs]
+        for key in keys:
+            groups = C.partition_by_key(proj, key)
+            usable = {cv: g for cv, g in groups.items()
+                      if g.n >= C.MIN_SUPPORT_PER_PARTITION}
+            if len(usable) < 2:
+                continue
+            z = C.tarone_z(list(usable.values()))
+            if z is None:
+                continue
+            pvalue = C.tarone_pvalue(list(usable.values()))
+            if pvalue is None:
+                continue
+            guardable = len(groups) <= max(
+                2, len(disc_obs) // (2 * C.MIN_SUPPORT_PER_PARTITION))
+            tested.append((value, key, usable, pvalue, guardable))
+    keep = C.benjamini_hochberg([t[3] for t in tested]) if tested else []
+    winner = None
+    for flag, (value, key, usable, _, guardable) in zip(keep, tested):
+        if not (flag and guardable):
+            continue
+        mdl = _mdl_fields(usable)
+        if mdl["dl_guard"] + mdl["dl_residual_given_guard"] < mdl["dl_residual"]:
+            winner = (value, key, usable, mdl)
+            break
+
+    if winner is not None:
+        value, key, usable, mdl = winner
+        # The context value where value==`value` concentrates (its highest rate).
+        best = max(usable, key=lambda cv: usable[cv].k / max(1, usable[cv].n))
+        # Guard + direction were chosen on discovery; the gate weighs hits/misses
+        # scored on the disjoint validation quarter that no statistic touched (M8):
+        # predict value==`value` iff key==best.
+        hits = misses = 0
+        for ctx, ov in val_obs:
+            if key not in ctx:
+                continue
+            predicted = ctx[key] == best
+            actual = ov == value
+            if predicted == actual:
+                hits += 1
+            else:
+                misses += 1
+        proposals.append(("guard", {
+            "head": {"pred": fact["pred"], "args": ["?x"]},
+            "body": {"literals": [],
+                     "guards": [{"var": f"?{key}", "op": "==", "value": best}]},
+            "support": {"left": min(g.n for g in usable.values()),
+                        "right": max(g.n for g in usable.values())},
+            "holdout": {"hits": hits, "misses": misses},
+            "mdl": mdl, "specificity": 1, "conditioning_key": key,
+            "conditioned_value": value, "target_fact": fact["id"],
+        }))
+        idx.execute("UPDATE facts SET dispersion_flag=1 WHERE id=?",
+                    (fact["id"],))
+        _open_question(idx, fact["id"], usable, key)
+
+    # §7 breadth for categorical: over ALL observations' recorded context (every
+    # categorical observation is informative — there is no single "confirming"
+    # outcome to filter on, unlike the binary path). Local to this branch, so
+    # binary breadth over confirming observations is untouched.
+    per_key = {k: [ctx[k] for ctx, _ in cat_obs if k in ctx] for k in keys}
+    report = C.breadth_report(per_key)
+    idx.execute("UPDATE facts SET breadth_class=? WHERE id=?",
+                (report["breadth_class"], fact["id"]))
     return proposals
 
 

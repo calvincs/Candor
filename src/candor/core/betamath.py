@@ -17,8 +17,13 @@ def log_beta(a: float, b: float) -> float:
     return math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)
 
 
-def _betacf(a: float, b: float, x: float) -> float:
-    """Continued fraction for the incomplete beta (Lentz's method, NR §6.4)."""
+def _betacf(a: float, b: float, x: float) -> tuple[float, bool]:
+    """Continued fraction for the incomplete beta (Lentz's method, NR §6.4).
+
+    Returns (value, converged). `converged` is False when the fraction has not
+    reached tolerance within the iteration budget — which happens once a + b is
+    large enough (~>1e6) that the truncated fraction is no longer trustworthy.
+    """
     qab, qap, qam = a + b, a + 1.0, a - 1.0
     c = 1.0
     d = 1.0 - qab * x / qap
@@ -26,6 +31,7 @@ def _betacf(a: float, b: float, x: float) -> float:
         d = _FPMIN
     d = 1.0 / d
     h = d
+    converged = False
     for m in range(1, 301):
         m2 = 2 * m
         aa = m * (b - m) * x / ((qam + m2) * (a + m2))
@@ -48,20 +54,49 @@ def _betacf(a: float, b: float, x: float) -> float:
         delta = d * c
         h *= delta
         if abs(delta - 1.0) < _EPS:
+            converged = True
             break
-    return h
+    return h, converged
+
+
+def _norm_cdf(z: float) -> float:
+    """Standard normal CDF, stdlib only (no scipy)."""
+    return 0.5 * math.erfc(-z / math.sqrt(2.0))
+
+
+def _betainc_normal(a: float, b: float, x: float) -> float:
+    """Normal approximation to I_x(a, b): Beta(a,b) ≈ N(a/(a+b), var). Excellent
+    in exactly the large-(a+b) regime where the continued fraction stops
+    converging. Bounded in [0, 1] by construction (erfc/2)."""
+    t = a + b
+    mean = a / t
+    sd = math.sqrt((a * b) / (t * t * (t + 1.0)))
+    if sd <= 0.0:
+        return 0.0 if x < mean else 1.0
+    return _norm_cdf((x - mean) / sd)
 
 
 def betainc(a: float, b: float, x: float) -> float:
-    """Regularized incomplete beta I_x(a, b) = P(X <= x) for X ~ Beta(a, b)."""
+    """Regularized incomplete beta I_x(a, b) = P(X <= x) for X ~ Beta(a, b).
+
+    Never returns a value outside [0, 1]: when the continued fraction fails to
+    converge (a + b beyond ~1e6) it falls back to the normal approximation
+    rather than silently returning garbage (M10).
+    """
     if x <= 0.0:
         return 0.0
     if x >= 1.0:
         return 1.0
     front = math.exp(a * math.log(x) + b * math.log1p(-x) - log_beta(a, b))
     if x < (a + 1.0) / (a + b + 2.0):
-        return front * _betacf(a, b, x) / a
-    return 1.0 - front * _betacf(b, a, 1.0 - x) / b
+        cf, converged = _betacf(a, b, x)
+        val = front * cf / a
+    else:
+        cf, converged = _betacf(b, a, 1.0 - x)
+        val = 1.0 - front * cf / b
+    if converged and 0.0 <= val <= 1.0:
+        return val
+    return _betainc_normal(a, b, x)
 
 
 def beta_pdf(a: float, b: float, x: float) -> float:

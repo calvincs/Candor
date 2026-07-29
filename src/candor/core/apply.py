@@ -128,10 +128,15 @@ def _apply_admission(idx: "Index", ev: "Event", payload: dict[str, Any]) -> None
              body.get("valid_from", ev.ts), body.get("valid_to"), ev.ts, ev.seq))
         # The admitted fact's audit trail is addressable from admission onward,
         # keyed by its proposer, at zero (I5: unobserved is ε, never a hard 0).
-        proposer = idx.one("SELECT proposer FROM candidates WHERE id=?", (cid,))
-        counts_mod.ensure_row(
-            idx, fid, proposer["proposer"] if proposer else ev.actor,
-            counts_mod.channel_for(body["stmt_type"]))
+        # A categorical fact has an OPEN vocabulary with no value known at
+        # admission, so there is no single baseline row to seed — its per-value
+        # tallies (fact_category_counts) become addressable on the first
+        # observation. So skip channel_for (which knows only epi/alea) for it.
+        if body["stmt_type"] != "categorical":
+            proposer = idx.one("SELECT proposer FROM candidates WHERE id=?", (cid,))
+            counts_mod.ensure_row(
+                idx, fid, proposer["proposer"] if proposer else ev.actor,
+                counts_mod.channel_for(body["stmt_type"]))
     elif kind == "constraint":
         idx.execute(
             "INSERT OR REPLACE INTO constraints(id, kind, body_json, structural, "
@@ -167,25 +172,45 @@ def _apply_alias(idx: "Index", ev: "Event", payload: dict[str, Any]) -> None:
 
 def _apply_observation(idx: "Index", ev: "Event", payload: dict[str, Any]) -> None:
     stmt = payload["stmt"]
-    outcome = bool(payload["outcome"])
     ctx = payload.get("ctx") or {}
+    value = payload.get("value")
     fid = facts_mod.lookup(idx, stmt["pred"], stmt["args"])
-    channel = None
+    # Which field is authoritative is decided HERE, at fold time, by the fact's
+    # stmt_type — not at the API (§1.4). An observation that arrives before its
+    # fact is admitted has fid=None and simply attributes nothing, exactly as the
+    # crisp/frequency path already does.
+    stmt_type = None
     if fid is not None:
         row = idx.one("SELECT stmt_type FROM facts WHERE id=?", (fid,))
-        channel = counts_mod.channel_for(row["stmt_type"])
-        counts_mod.apply_observation(idx, fid, ev.actor, channel, outcome)
+        stmt_type = row["stmt_type"] if row else None
+    categorical = stmt_type == "categorical"
+    channel: Optional[str] = None
+    outcome_col: Optional[int] = None
+    outcome = bool(payload.get("outcome"))
+    if categorical:
+        # Categorical: the realised value moves the per-value tallies; outcome is
+        # ignored and stored NULL. channel='cat' partitions these rows off the
+        # epi/alea observation stream.
+        channel = "cat"
+        counts_mod.apply_category_observation(idx, fid, ev.actor, value)
+    else:
+        outcome_col = 1 if outcome else 0
+        if fid is not None:
+            channel = counts_mod.channel_for(stmt_type)
+            counts_mod.apply_observation(idx, fid, ev.actor, channel, outcome)
     idx.execute(
         "INSERT OR REPLACE INTO observations(event_seq, fact_id, actor, outcome, "
-        "grade, channel, context_sig, ts) VALUES(?,?,?,?,?,?,?,?)",
-        (ev.seq, fid, ev.actor, 1 if outcome else 0,
-         int(payload.get("grade", 0)), channel, ev.context_sig, ev.ts))
-    for key, value in sorted(ctx.items()):
+        "grade, channel, context_sig, value, ts) VALUES(?,?,?,?,?,?,?,?,?)",
+        (ev.seq, fid, ev.actor, outcome_col,
+         int(payload.get("grade", 0)), channel, ev.context_sig, value, ev.ts))
+    for key, cval in sorted(ctx.items()):
         idx.execute(
             "INSERT OR REPLACE INTO obs_context(event_seq, key, value) VALUES(?,?,?)",
-            (ev.seq, str(key), str(value)))
+            (ev.seq, str(key), str(cval)))
     _bump_quota(idx, ev.actor, "observation")
-    if fid is not None:
+    # Pin tension is a boolean-outcome semantics; a categorical observation has no
+    # true/false outcome to contradict a '-' pin, so it is skipped for those.
+    if fid is not None and not categorical:
         _check_pin_tension(idx, ev, fid, outcome)
 
 
@@ -226,16 +251,22 @@ def _apply_demotion(idx: "Index", ev: "Event", payload: dict[str, Any]) -> None:
 
 
 def _apply_claim(idx: "Index", ev: "Event", payload: dict[str, Any]) -> None:
+    # A categorical claim freezes its full predicted DISTRIBUTION (design §4.1),
+    # not a scalar predicted_p; it is snapshot-pinned here so resolution can score
+    # the realised value's surprisal against it. NULL for crisp/frequency.
+    dist = payload.get("predicted_dist")
     idx.execute(
         "INSERT OR REPLACE INTO claims(id, stmt_json, frame, settlement, verifier_id, "
         "due_ts, predicted_p, predicted_ci_lo, predicted_ci_hi, model_snapshot, "
-        "predictor_class, certainty_class, resolved_ts, outcome, surprisal) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL)",
+        "predictor_class, certainty_class, resolved_ts, outcome, surprisal, "
+        "predicted_dist_json) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?)",
         (payload["claim_id"], canon_json(payload["stmt"]), payload["frame"],
          payload["settlement"], payload.get("verifier_id"), payload.get("due"),
          payload.get("predicted_p"), payload.get("ci_lo"), payload.get("ci_hi"),
          payload["model_snapshot"], payload["predictor_class"],
-         payload.get("certainty_class")))
+         payload.get("certainty_class"),
+         canon_json(dist) if dist is not None else None))
     for i, (comp, sens) in enumerate(sorted((payload.get("sensitivity") or {}).items())):
         idx.execute(
             "INSERT OR REPLACE INTO proof_steps(claim_id, step_no, rule_id, fact_id, "
@@ -254,6 +285,25 @@ def _apply_resolution(idx: "Index", ev: "Event", payload: dict[str, Any]) -> Non
         "UPDATE claims SET resolved_ts=?, outcome=?, surprisal=? WHERE id=?",
         (ev.ts, 1 if outcome else 0, payload.get("surprisal"), claim_id))
     if row is None:
+        return
+    # ── categorical settlement (design §4): the verifier reported a realised
+    # value v*, and the payload carries the multiclass surprisal −log P(v*) plus
+    # P(v*) itself (both frozen at resolve time against the claim's snapshot). It
+    # calibrates under the DISTINCT categorical predictor_class (I9 — never pools
+    # with binary) and scores per-source trust via one-vs-rest, not the binary
+    # two-coin scorer. No credit-assignment blame: a categorical fact is a leaf
+    # query, not a proof literal (decision 3).
+    if payload.get("realized_value") is not None:
+        calibration_mod.record(idx, row["frame"], row["settlement"],
+                               row["predictor_class"],
+                               float(payload.get("predicted_p") or 0.0),
+                               True, ev.ts)
+        if payload.get("oracle_kind") == "deterministic_total":
+            stmt = json.loads(row["stmt_json"])
+            fid = facts_mod.lookup(idx, stmt["pred"], stmt["args"])
+            if fid is not None:
+                reliability_mod.score_category_against_settlement(
+                    idx, fid, payload["realized_value"], row["frame"])
         return
     calibration_mod.record(idx, row["frame"], row["settlement"],
                            row["predictor_class"], float(row["predicted_p"] or 0.5),
@@ -297,6 +347,26 @@ def _apply_checkpoint(idx: "Index", ev: "Event", payload: dict[str, Any]) -> Non
                 "VALUES(?,?,?)", (ev.ts, "checkpoint", canon_json(payload)))
 
 
+def _apply_reliability(idx: "Index", ev: "Event", payload: dict[str, Any]) -> None:
+    """Operator trust override, folded in ledger order (I1/I3).
+
+    Writes the actor_reliability Beta — consumed by the alea (frequency) discount
+    via `reliability.expected` — and records the override in a dedicated table so
+    the crisp-vote path (`_actor_discounts`) tempers on operator levers ONLY.
+    Learned settlement reliability moves actor_reliability too, but it already
+    speaks through the two-coin LR; counting it on the crisp path as well would
+    double-count the same settlements, so it must never enter this table.
+    """
+    actor = payload["actor"]
+    frame = payload["frame"]
+    a, b = float(payload["rel_a"]), float(payload["rel_b"])
+    reliability_mod.set_reliability(idx, actor, frame, a, b)
+    idx.execute(
+        "INSERT INTO reliability_overrides(actor, frame, rel_a, rel_b) "
+        "VALUES(?,?,?,?) ON CONFLICT(actor, frame) DO UPDATE SET "
+        "rel_a=excluded.rel_a, rel_b=excluded.rel_b", (actor, frame, a, b))
+
+
 _HANDLERS = {
     "assertion": _apply_assertion,
     "admission": _apply_admission,
@@ -310,6 +380,7 @@ _HANDLERS = {
     "redaction": _apply_redaction,
     "retraction": _apply_retraction,
     "checkpoint": _apply_checkpoint,
+    "reliability": _apply_reliability,
 }
 
 
@@ -417,6 +488,8 @@ _HASH_QUERIES: tuple[tuple[str, str], ...] = (
               "FROM facts ORDER BY id"),
     ("fact_counts", "SELECT fact_id, actor, channel, n, k FROM fact_counts "
                     "ORDER BY fact_id, actor, channel"),
+    ("fact_category_counts", "SELECT fact_id, actor, value, n FROM "
+                             "fact_category_counts ORDER BY fact_id, actor, value"),
     ("rules", "SELECT id, head_json, body_json, specificity, structural, numeric, "
               "admitted_at FROM rules ORDER BY id"),
     ("rule_counts", "SELECT rule_id, actor, n, k FROM rule_counts ORDER BY rule_id, actor"),
@@ -429,7 +502,8 @@ _HASH_QUERIES: tuple[tuple[str, str], ...] = (
     ("oracles", "SELECT id, kind, impl_ref, code_hash, env_hash, n_trials, n_correct "
                 "FROM oracles ORDER BY id"),
     ("claims", "SELECT id, stmt_json, frame, settlement, predicted_p, model_snapshot, "
-               "resolved_ts, outcome FROM claims ORDER BY id"),
+               "resolved_ts, outcome, surprisal, predicted_dist_json "
+               "FROM claims ORDER BY id"),
     ("calibration", "SELECT frame, settlement, predictor_class, bucket, n, k, p_milli "
                     "FROM calibration ORDER BY frame, settlement, predictor_class, bucket"),
     ("open_questions", "SELECT id, kind, target_kind, target_id, residual_partition, "
@@ -438,6 +512,8 @@ _HASH_QUERIES: tuple[tuple[str, str], ...] = (
     ("redactions", "SELECT payload_hash FROM redactions ORDER BY payload_hash"),
     ("actor_reliability", "SELECT actor, frame, rel_a, rel_b FROM actor_reliability "
                           "ORDER BY actor, frame"),
+    ("reliability_overrides", "SELECT actor, frame, rel_a, rel_b "
+                              "FROM reliability_overrides ORDER BY actor, frame"),
     ("actor_confusion", "SELECT actor, frame, tp, fn, fp, tn FROM actor_confusion "
                         "ORDER BY actor, frame"),
     ("actor_response", "SELECT actor, frame, vote, grade, n_true, n_false "

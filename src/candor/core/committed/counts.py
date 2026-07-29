@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterable
 
+from ..betamath import betaincinv
 from . import reliability
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -41,6 +42,23 @@ EPI_PRIOR_FREQUENCY = (99.0, 1.0)
 EPI_PRIOR_CRISP = (1.0, 1.0)      # uniform: truth is what observations decide
 ALEA_PRIOR_A = 1.0    # uniform Dirichlet over the outcome rate
 ALEA_PRIOR_B = 1.0
+
+# ── categorical (open-vocabulary) read-time constant ──────────────────────────
+# The single pre-registered Dirichlet-process / CRP concentration for categorical
+# facts (design §2.2, decision 1). Like GAMMA (reliability.py:44) and the epi
+# priors above it is a READ-TIME constant — never stored — so it must ride in the
+# categorical prediction's snapshot/predictor version (calibration.
+# categorical_snapshot_id, I8): a re-tuned alpha reshapes every categorical
+# prediction and must therefore change the snapshot id, never move silently.
+# v1 pins the Pitman–Yor discount d=0 (pure CRP), so P(unknown)=alpha/(N+alpha)
+# is a function of N alone; d>0 (unknown grows with the distinct-value count) is
+# the documented future one-constant upgrade.
+CATEGORICAL_ALPHA = 1.0
+
+# 90% central credible interval, same convention as the scalar path
+# (periphery/predict.py CI_LO/CI_HI). Kept local so `core` never imports
+# `periphery`.
+CAT_CI_LO, CAT_CI_HI = 0.05, 0.95
 
 CHANNEL_FOR_STMT_TYPE = {"crisp": "epi", "frequency": "alea"}
 
@@ -80,6 +98,172 @@ def apply_observation(idx: "Index", fact_id: str, actor: str, channel: str,
         "UPDATE fact_counts SET n = n + 1, k = k + ? "
         "WHERE fact_id=? AND actor=? AND channel=?",
         (1 if outcome else 0, fact_id, actor, channel))
+
+
+def apply_category_observation(idx: "Index", fact_id: str, actor: str,
+                               value: str) -> None:
+    """Integer increment of a per-value tally (categorical C1, §1.4).
+
+    Exact analog of `apply_observation`: respects numeric='frozen' as a no-op,
+    INSERT OR IGNORE a zero row then UPDATE n=n+1. The open vocabulary is
+    expressed by a brand-new value simply becoming a new (fact,actor,value) row.
+    Integer increment, never a delta — so fold order is irrelevant to the stored
+    counts (I3), same guarantee fact_counts already relies on.
+    """
+    if value is None:
+        return
+    row = idx.one("SELECT numeric FROM facts WHERE id=?", (fact_id,))
+    if row is None or row["numeric"] == "frozen":
+        return
+    value = str(value)
+    idx.execute(
+        "INSERT OR IGNORE INTO fact_category_counts(fact_id, actor, value, n) "
+        "VALUES(?,?,?,0)", (fact_id, actor, value))
+    idx.execute(
+        "UPDATE fact_category_counts SET n = n + 1 "
+        "WHERE fact_id=? AND actor=? AND value=?", (fact_id, actor, value))
+
+
+@dataclass(frozen=True)
+class CategoricalSlice:
+    """One slice of a categorical predictive: a point probability and its Beta
+    marginal credible interval. Used for each seen value AND the unknown mass."""
+    p: float
+    ci: tuple[float, float]
+
+
+@dataclass(frozen=True)
+class CategoricalPosterior:
+    """The read-time CRP predictive over {seen values} ∪ {unknown} (design §2).
+
+    `values` is in a fixed canonical order (ORDER BY value); the `unknown` slice
+    is conceptually last. `Σ values.p + unknown.p == 1.0` exactly (§2.1)."""
+    values: dict[str, CategoricalSlice]
+    unknown: CategoricalSlice
+    total_observations: int
+
+
+def category_posterior(idx: "Index", fact_id: str,
+                       alpha: float = CATEGORICAL_ALPHA) -> CategoricalPosterior:
+    """CRP / Dirichlet-process predictive over an OPEN vocabulary (design §2.1,
+    Option B; decision 1 LOCKED to d=0 — CRP, not Pitman–Yor, not a fixed bucket).
+
+    Read-time only (I11): the stored truth is the integer per-value tallies in
+    `fact_category_counts`; every probability here is composed on read and never
+    written back — the same discipline as `compose()`.
+
+    Let ``n_v`` be the count for each seen value ``v`` and ``N = Σ_v n_v``. With
+    concentration ``alpha > 0`` the CRP predictive is
+
+        P(v)       = n_v / (N + alpha)     for each seen value v
+        P(unknown) = alpha / (N + alpha)   the first-class never-seen mass
+
+    which sums to exactly 1 (§2.1). The unknown slice is a CATEGORY, not an error
+    bar: thin data ⇒ large unknown; as N grows P(unknown) → alpha/N → 0 and mass
+    concentrates on the seen values. Under d=0 it is a function of N alone.
+
+    Per-value credible intervals are the Beta MARGINALS of the Dirichlet (§2.3),
+    reusing `betamath` verbatim — the SAME deterministic numerics the frequency
+    path uses, no sampler:
+
+        p_v        ~ Beta(n_v, (N + alpha) − n_v)
+        p_unknown  ~ Beta(alpha, N)
+
+    Values iterate in a fixed canonical order (ORDER BY value, unknown last) so
+    the whole distribution is order-insensitive and reproduces bit-for-bit under
+    `predict_at` (I3/I8).
+    """
+    # C3: compose per (actor, value), so the one-vs-rest reliability DISCOUNT can
+    # multiply into each actor's contribution — the categorical analog of
+    # compose() weighting each actor's counts by reliability.expected(actor).
+    # Iteration is ORDER BY value, actor: values stay in canonical order (unknown
+    # last) and the per-value float accumulation over actors is fixed, so the
+    # whole distribution is order-insensitive and reproduces bit-for-bit (I3/I8).
+    # A never-settled (actor, value) weights at EXACTLY 1.0, so an un-scored store
+    # reduces to the C2 raw-count posterior byte-for-byte.
+    rows = idx.query(
+        "SELECT actor, value, SUM(n) AS n FROM fact_category_counts WHERE fact_id=? "
+        "GROUP BY value, actor ORDER BY value, actor", (fact_id,))
+    discounted: dict[str, float] = {}   # value → Σ_actor weight(actor,value)·n_v
+    raw_total = 0                        # raw observation count (I11 truth)
+    for r in rows:
+        n = int(r["n"])
+        if n <= 0:
+            continue
+        raw_total += n
+        value = r["value"]
+        weight = reliability.category_report_weight(idx, r["actor"], value)
+        discounted[value] = discounted.get(value, 0.0) + weight * n
+    counts = [(value, dn) for value, dn in discounted.items() if dn > 0]
+    total = sum(dn for _, dn in counts)   # discounted effective N (drives denom)
+    denom = float(total) + alpha
+
+    values: dict[str, CategoricalSlice] = {}
+    seen_mass = 0.0
+    for value, dn in counts:
+        p = dn / denom
+        seen_mass += p
+        lo = betaincinv(float(dn), denom - dn, CAT_CI_LO)
+        hi = betaincinv(float(dn), denom - dn, CAT_CI_HI)
+        values[value] = CategoricalSlice(p, (lo, hi))
+
+    if raw_total == 0:
+        # Never observed: the whole predictive mass is the unknown category.
+        # Beta(alpha, 0) is degenerate, so report a point interval at 1.0.
+        unknown = CategoricalSlice(1.0, (1.0, 1.0))
+    else:
+        # The unknown mass is carried as the residual 1 − Σ P(v), so the vector
+        # sums to EXACTLY 1.0 under the same canonical left-to-right summation a
+        # caller uses (§2.1). This equals alpha/(N+alpha) to the last bit (it is
+        # bit-exact whenever the seen mass ≥ 0.5, i.e. N ≥ alpha, which holds for
+        # every N ≥ 1 at the default alpha=1.0 — Sterbenz).
+        p_unknown = 1.0 - seen_mass
+        lo = betaincinv(alpha, float(total), CAT_CI_LO)
+        hi = betaincinv(alpha, float(total), CAT_CI_HI)
+        unknown = CategoricalSlice(p_unknown, (lo, hi))
+
+    # total_observations reports the RAW integer count (never the discounted
+    # effective N): it is a fact-level tally, and predict()'s no_observations
+    # caveat keys on it being truly zero.
+    return CategoricalPosterior(values, unknown, raw_total)
+
+
+def category_group_posterior(per_value_counts: dict[str, int], total_n: int,
+                             alpha: float = CATEGORICAL_ALPHA) -> CategoricalPosterior:
+    """CRP predictive for ONE context group (categorical C4, design §3).
+
+    The §2 CRP formula run over a single context group's RAW per-value tallies —
+    the read-time numerics of `category_posterior` factored out so the marginal
+    and every per-context conditional share one deterministic kernel. Each group
+    gets its OWN unknown slice: a rarely-seen context is itself mostly-unknown,
+    which is correct (§3). Values iterate in a fixed canonical order (ORDER BY
+    value); the unknown mass is carried as the residual 1 − Σ P(v) so the vector
+    sums to exactly 1 under the same left-to-right summation (§2.1), and it is a
+    pure function of the integer counts, so it reproduces bit-for-bit (I3/I8).
+
+    Unlike the marginal this view is UN-discounted (raw observation counts, not
+    the C3 per-(actor,value) reliability weight): the conditional breakdown answers
+    "given context c, what did this fact actually do," an honest per-group tally.
+    """
+    denom = float(total_n) + alpha
+    values: dict[str, CategoricalSlice] = {}
+    seen_mass = 0.0
+    for value in sorted(per_value_counts):
+        n = int(per_value_counts[value])
+        if n <= 0:
+            continue
+        p = n / denom
+        seen_mass += p
+        lo = betaincinv(float(n), denom - n, CAT_CI_LO)
+        hi = betaincinv(float(n), denom - n, CAT_CI_HI)
+        values[value] = CategoricalSlice(p, (lo, hi))
+    if total_n <= 0:
+        unknown = CategoricalSlice(1.0, (1.0, 1.0))
+    else:
+        lo = betaincinv(alpha, float(total_n), CAT_CI_LO)
+        hi = betaincinv(alpha, float(total_n), CAT_CI_HI)
+        unknown = CategoricalSlice(1.0 - seen_mass, (lo, hi))
+    return CategoricalPosterior(values, unknown, total_n)
 
 
 def apply_rule_observation(idx: "Index", rule_id: str, actor: str,

@@ -101,6 +101,147 @@ def permutation(tag: str, n: int) -> list[int]:
 
 _UNIT_GRID_CACHE: dict[int, list[float]] = {}
 
+# Mantissa bounds of a normal IEEE-754 double: any float in a binade equals
+# m·ulp with m ∈ [2**52, 2**53).
+_M_LO = 1 << 52
+_M_HI = 1 << 53
+
+
+def _batch_binade(s: float, d: float, cap: int) -> Optional[tuple[int, float]]:
+    """Add `+d` to `s` up to `cap` times while the increment stays exactly `d`.
+
+    Within one binade every float is a multiple of ulp(s) and the per-step
+    increment `d = fl(s+x)-s` is constant, so `s + t·d` stays exactly
+    representable — the batch is bit-identical to `t` separate rounded adds.
+    Returns (steps, s_after), or None to defer to one explicit step (binade
+    edge, subnormal, or a non-clean increment).
+    """
+    _, exp = math.frexp(s)
+    u = math.ldexp(1.0, exp - 53)              # ulp(s)
+    if u == 0.0:                               # subnormal region: don't risk it
+        return None
+    fm = abs(s) / u
+    fmd = abs(d) / u
+    if fm != int(fm) or fmd != int(fmd):       # not clean multiples of ulp(s)
+        return None
+    m, md = int(fm), int(fmd)
+    if md < 1 or not (_M_LO <= m < _M_HI):
+        return None
+    if (s > 0.0) == (d > 0.0):                 # |s| growing toward the top edge
+        room = (_M_HI - 1 - m) // md
+        t = room if room < cap else cap
+        new_m = m + t * md
+    else:                                      # |s| shrinking toward the low edge
+        room = (m - _M_LO) // md
+        t = room if room < cap else cap
+        new_m = m - t * md
+    if t < 1 or not (_M_LO <= new_m < _M_HI):
+        return None
+    return t, math.copysign(math.ldexp(float(new_m), exp - 53), s)
+
+
+def _fold_add(acc: float, x: float, count: int) -> float:
+    """Exact value of ``for _ in range(count): acc = acc + x`` in O(log count).
+
+    A crisp fact accumulates one log-LR contribution per observation; identical
+    observations contribute the identical value in a given world (H8), so a run
+    of `count` of them can be collapsed. Multiplying `x` by `count` is NOT
+    bit-identical to the fold — IEEE rounds each add, not once — so we reproduce
+    the fold exactly, batching whole binades where the increment is constant.
+    """
+    if count <= 0:
+        return acc
+    if x == 0.0:
+        return acc + 0.0                       # normalises -0.0, then idempotent
+    remaining = count
+    s = acc
+    while remaining > 0:
+        s1 = s + x
+        d = s1 - s
+        if d == 0.0:                           # x absorbed: no add can move s
+            return s
+        if remaining == 1:
+            return s1
+        if (s1 + x) - s1 != d:                 # increment not yet constant
+            s = s1
+            remaining -= 1
+            continue
+        batched = _batch_binade(s, d, remaining)
+        if batched is None:
+            s = s1
+            remaining -= 1
+            continue
+        t, s = batched
+        remaining -= t
+    return s
+
+
+def _vote_runs(votes: tuple[tuple[str, int, int, Optional[str]], ...]
+               ) -> list[list]:
+    """Maximal contiguous runs of an identical (actor, vote, grade, sig) key as
+    ``[actor, vote, grade, sig, count]``. Order-preserving: folding a run's one
+    contribution `count` times reproduces the per-vote fold bit-for-bit."""
+    runs: list[list] = []
+    for actor, vote, grade, sig in votes:
+        if runs:
+            last = runs[-1]
+            if (last[0] == actor and last[1] == vote
+                    and last[2] == grade and last[3] == sig):
+                last[4] += 1
+                continue
+        runs.append([actor, vote, grade, sig, 1])
+    return runs
+
+
+#: H8b: how many more contiguous runs than distinct vote CLASSES a crisp fact
+#: must have before it is judged "flaky". At 2×, a stable fact (long same-outcome
+#: runs → runs ≈ classes) and a one-way changepoint (two runs, two classes) both
+#: stay on the exact contiguous fold; an alternating/oscillating fact (runs ≈
+#: votes ≫ classes) trips it.
+FLAKY_RUN_FACTOR = 2
+
+
+def is_flaky(votes: tuple[tuple[str, int, int, Optional[str]], ...]) -> bool:
+    """Does this crisp fact's vote sequence barely collapse into contiguous runs?
+
+    H8 flattens a *stable* crisp fact (long same-outcome runs) to O(runs) per
+    world, but an *alternating* one degenerates back to O(observations): every
+    run has length 1, so the contiguous fold saves nothing. Such a fact is, by
+    construction, uncertain — spending bit-precision on it is pointless. This is
+    the cheap, DETERMINISTIC detector: compare the run count to the number of
+    distinct (actor, vote, grade, context_sig) classes. It is a pure function of
+    the folded votes, so a replay classifies identically and `predict_at`
+    reproduces both the path taken and the number produced (I8). When it fires,
+    `_draw` groups votes BY KEY (flat, O(classes) per world) and the caller
+    surfaces an ``unstable`` caveat.
+    """
+    runs = _vote_runs(votes)
+    n_classes = len({(a, v, g, s) for a, v, g, s, _ in runs})
+    return n_classes > 0 and len(runs) > FLAKY_RUN_FACTOR * n_classes
+
+
+def _by_key_class(votes: tuple[tuple[str, int, int, Optional[str]], ...]
+                  ) -> list[list]:
+    """Votes summed BY KEY across the whole (possibly interleaved) sequence, as
+    ``[actor, vote, grade, sig, total_count]`` in a deterministic order.
+
+    Unlike `_vote_runs` this merges every occurrence of a key regardless of
+    interleaving, so a per-world fold over these is O(distinct classes), not
+    O(runs). Folding a key's contribution over its TOTAL count reassociates the
+    additions relative to the contiguous fold, so the logodds differ by ~1e-14 —
+    deterministic (a pure function of the votes), just not bit-identical to the
+    exact fold. The per-context group SIZE (the sub-additive denominator) is the
+    same integer either way, so only the numerator's last bits move.
+    """
+    merged: dict[tuple[str, int, int, Optional[str]], int] = {}
+    for actor, vote, grade, sig in votes:
+        key = (actor, vote, grade, sig)
+        merged[key] = merged.get(key, 0) + 1
+    return [[a, v, g, s, c] for (a, v, g, s), c in sorted(
+        merged.items(),
+        key=lambda kv: (kv[0][0], "" if kv[0][3] is None else "z" + kv[0][3],
+                        kv[0][1], kv[0][2]))]
+
 
 def _unit_grid(s: int) -> list[float]:
     grid = _UNIT_GRID_CACHE.get(s)
@@ -114,6 +255,13 @@ def _unit_grid(s: int) -> list[float]:
 class _Draws:
     truth: list[int]
     theta: list[float]
+    # Per-world CONTINUOUS mass the credible interval is taken from, in place of
+    # the 0/1 `truth`×`theta` mass whose quantiles collapse to a degenerate coin
+    # for a crisp fact (H3). Per fact type it carries the channel the interval is
+    # meant to convey: the aleatoric rate for a frequency fact (§6.4), and the
+    # continuous epistemic validity for a crisp fact — the sigmoid of the world's
+    # log-odds when it has votes, the sampled epi-Beta quantile otherwise.
+    cont: list[float]
 
 
 def _actor_param_grids(problem: Problem, s: int) -> dict[str, tuple[list[float],
@@ -146,19 +294,33 @@ def _draw(state: FactState, s: int,
           discounts: Optional[dict[str, float]] = None) -> _Draws:
     if state.pinned_negative:
         # A '-' pin is the only hard zero in the system (I5).
-        return _Draws([0] * s, [0.0] * s)
+        return _Draws([0] * s, [0.0] * s, [0.0] * s)
     perm_u = permutation(state.fact_id + "|bernoulli", s)
     unit = _unit_grid(s)
     if state.stmt_type == "crisp" and state.votes and actor_params:
         # v0.3 Δ1/Δ2: validity via two-coin log-LR composition under the
         # world's sampled actor parameters, sub-additive within context groups.
+        # H8: identical votes contribute the identical log-LR in a given world,
+        # so we collapse maximal runs ONCE and fold each run's contribution by
+        # its count — the per-world loop is O(distinct runs), not O(votes), and
+        # bit-identical to the per-vote fold (see `_fold_add`).
+        #
+        # H8b: on a FLAKY fact the outcomes interleave, so contiguous runs barely
+        # collapse and the fold is O(observations) again. There we group votes BY
+        # KEY instead (O(distinct classes) per world) — deterministic, ~1e-14 off
+        # the exact fold, never bit-identical to it. `is_flaky` is a pure function
+        # of the votes, so the choice replays identically; the flaky path never
+        # touches a stable fact, whose output stays bit-for-bit unchanged.
         lr_table = response_lr or {}
+        items = (_by_key_class(state.votes) if is_flaky(state.votes)
+                 else _vote_runs(state.votes))
         truth = []
+        cont = []
         for i in range(s):
             groups: dict[str, float] = {}
             sizes: dict[str, int] = {}
             singles = 0.0
-            for actor, vote, grade, sig in state.votes:
+            for actor, vote, grade, sig, count in items:
                 if grade > 0 and (actor, vote, grade) in lr_table:
                     contribution = lr_table[(actor, vote, grade)]   # Δ6 mean LR
                 else:
@@ -167,25 +329,36 @@ def _draw(state: FactState, s: int,
                 if discounts:
                     contribution = temper(contribution, discounts.get(actor, 1.0))
                 if sig is None:
-                    singles += contribution
+                    singles = _fold_add(singles, contribution, count)
                 else:
-                    groups[sig] = groups.get(sig, 0.0) + contribution
-                    sizes[sig] = sizes.get(sig, 0) + 1
+                    groups[sig] = _fold_add(groups.get(sig, 0.0), contribution,
+                                            count)
+                    sizes[sig] = sizes.get(sig, 0) + count
             logodds = singles + sum(sub / (sizes[g] ** GAMMA)
                                     for g, sub in groups.items())
             p = 1.0 / (1.0 + math.exp(-max(-60.0, min(60.0, logodds))))
+            cont.append(p)
             truth.append(1 if unit[perm_u[i]] < p else 0)
-        return _Draws(truth, [1.0] * s)
+        return _Draws(truth, [1.0] * s, cont)
     epi_grid = beta_quantile_grid(state.epi[0], state.epi[1], s)
     perm_v = permutation(state.fact_id + "|validity", s)
-    truth = [1 if unit[perm_u[i]] < epi_grid[perm_v[i]] else 0 for i in range(s)]
+    validity = [epi_grid[perm_v[i]] for i in range(s)]
+    truth = [1 if unit[perm_u[i]] < validity[i] else 0 for i in range(s)]
     if state.stmt_type == "frequency":
         alea_grid = beta_quantile_grid(state.alea[0], state.alea[1], s)
         perm_t = permutation(state.fact_id + "|rate", s)
         theta = [alea_grid[perm_t[i]] for i in range(s)]
+        # A frequency prediction's interval conveys the ALEATORIC rate — that is
+        # the channel §6.4 "two-channel recovery" recovers. The admitted fact's
+        # epistemic validity (≈1) is already summarised by the point estimate.
+        cont = theta
     else:
         theta = [1.0] * s
-    return _Draws(truth, theta)
+        # A crisp fact carries no rate, so its interval conveys the EPISTEMIC
+        # validity as a continuous quantity — not the 0/1 threshold, whose
+        # quantiles are a degenerate coin (H3).
+        cont = validity
+    return _Draws(truth, theta, cont)
 
 
 # ── model counting over the proof DNF, under per-literal masses ─────────────
@@ -254,6 +427,7 @@ def run(problem: Problem, budget: int) -> Outcome:
     groups = [g for g in groups if len(g) > 1]
 
     accepted: list[float] = []
+    continuous: list[float] = []
     aleatoric_only: list[float] = []
     rejected = 0
     for i in range(s):
@@ -267,6 +441,10 @@ def run(problem: Problem, budget: int) -> Outcome:
             continue
         mass = {fid: draws[fid].truth[i] * draws[fid].theta[i] for fid in draws}
         accepted.append(_wmc(problem.dnf, mass))
+        # Same world, continuous per-fact mass instead of the 0/1 threshold: the
+        # distribution the credible interval is a quantile of (H3).
+        cont_mass = {fid: draws[fid].cont[i] for fid in draws}
+        continuous.append(_wmc(problem.dnf, cont_mass))
         pure_theta = {fid: draws[fid].theta[i] for fid in draws}
         aleatoric_only.append(_wmc(problem.dnf, pure_theta))
 
@@ -278,11 +456,24 @@ def run(problem: Problem, budget: int) -> Outcome:
                        {}, {}, frozenset(problem.caveats | {"constraint_tension"}),
                        1.0, s, True)
 
-    p = sum(accepted) / n_acc
-    ordered = sorted(accepted)
-    ci = (_quantile(ordered, CI_LO), _quantile(ordered, CI_HI))
+    p_accepted = sum(accepted) / n_acc
+    # The credible interval is a quantile of the CONTINUOUS per-world posterior,
+    # not of the thresholded 0/1 accepted values (which for a crisp fact are a
+    # coin, giving a degenerate interval) (H3).
+    ordered_cont = sorted(continuous)
+    ci = (_quantile(ordered_cont, CI_LO), _quantile(ordered_cont, CI_HI))
+    # Keep the reported point estimate as the accepted-value mean when it already
+    # lies inside its own interval (minimal disruption); otherwise report the
+    # mean of the very distribution the interval is taken from, so p and ci
+    # describe ONE distribution. Clamp last: the point estimate is a summary of
+    # its interval and can never sit outside it.
+    p = p_accepted
+    if not (ci[0] <= p <= ci[1]):
+        p = sum(continuous) / n_acc
+        p = min(ci[1], max(ci[0], p))
+    # Epistemic spread stays a property of the accepted-value distribution.
     mean_sq = sum(x * x for x in accepted) / n_acc
-    epistemic = math.sqrt(max(0.0, mean_sq - p * p))
+    epistemic = math.sqrt(max(0.0, mean_sq - p_accepted * p_accepted))
     has_frequency = any(st.stmt_type == "frequency" for st in problem.facts.values())
     aleatoric = (sum(aleatoric_only) / n_acc) if has_frequency else 0.0
 

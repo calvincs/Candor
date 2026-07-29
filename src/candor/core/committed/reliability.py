@@ -23,6 +23,8 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+from ..hashing import canon_json
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..index import Index
 
@@ -247,3 +249,96 @@ def score_against_settlement(idx: "Index", fact_id: str, outcome: bool,
         record_confusion(idx, actor, frame, vote, bool(outcome))
         scored.append((actor, agreed))
     return scored
+
+
+# ── categorical one-vs-rest per-source trust (design §4.2 Option B, LOCKED) ────
+# Multiclass trust reduces to the EXISTING two-coin machinery, one binary
+# proposition per value: "is the value v?". Each (actor, value) pair is scored
+# under a per-value VIRTUAL ACTOR key, so record_confusion / record_response /
+# rates / log_lr / response_log_lr are reused VERBATIM and the cells ride the
+# existing actor_confusion / actor_response tables — already integer (I11) and
+# already in _HASH_QUERIES (replay determinism). NOT the full Dawid–Skene
+# confusion matrix (that cross-value structure is the deferred successor); this
+# reduction only learns each value's own hit / false-alarm rates.
+
+# The prior operating point's positive-vote log-LR, log(sens/fpr) at zero data
+# (= log 19). A per-(actor,value) discount is expressed RELATIVE to this: an
+# actor scored no worse than a newcomer keeps weight 1.0; only demonstrated
+# unreliability (LR below the newcomer prior) discounts its reports.
+PRIOR_LOG_LR = math.log(SENS_PRIOR[0] / FPR_PRIOR[0])   # log(9.5/0.5) = log(19)
+
+
+def _cat_key(actor: str, value: str) -> str:
+    """The per-value virtual actor id (design §4.2). A canonical, collision-free
+    encoding of (actor, value) that cannot equal any real actor name, so these
+    rows never contaminate a real-actor confusion read (`WHERE actor=?`)."""
+    return "catv1:" + canon_json([str(actor), str(value)])
+
+
+def _cat_record(idx: "Index", actor: str, value: str, frame: str,
+                vote: bool, outcome: bool) -> None:
+    """Fold one one-vs-rest vote for proposition `value` into BOTH the confusion
+    and response ledgers under the virtual key. Categorical votes are ungraded
+    (grade 0), so the response ledger degrades to the binary Δ1 cells."""
+    key = _cat_key(actor, value)
+    record_confusion(idx, key, frame, vote, outcome)
+    record_response(idx, key, frame, vote, 0, outcome)
+
+
+def score_category_against_settlement(idx: "Index", fact_id: str,
+                                      realized_value: str,
+                                      frame: str = FACT_FRAME) -> None:
+    """Score every prior observation on `fact_id` against a trusted categorical
+    settlement (realised value v*), via the one-vs-rest reduction (§4.2).
+
+    Each observation reporting value r contributes:
+      * proposition v*  : vote=(r==v*), outcome=True  (the truth WAS v*), and
+      * proposition r   : vote=True, outcome=(r==v*)   (only when r≠v*, a report
+                          that turned out wrong is a false positive for r).
+
+    The uninformative propositions (v ∉ {r, v*}) are elided — they carry no
+    settlement evidence and their count is unbounded over an open vocabulary.
+    Called ONLY from the deterministic_total settlement path (apply.py, §3.12).
+    """
+    realized_value = str(realized_value)
+    rows = idx.query(
+        "SELECT actor, value FROM observations WHERE fact_id=? AND value IS NOT NULL "
+        "ORDER BY event_seq", (fact_id,))
+    for row in rows:
+        actor = row["actor"]
+        reported = str(row["value"])
+        # Proposition v*: was the truth v*? Yes. Did you report it?
+        _cat_record(idx, actor, realized_value, frame,
+                    vote=(reported == realized_value), outcome=True)
+        # Proposition r (the report itself), only if it was NOT the truth: a
+        # positive vote that turned out false — a false alarm for value r.
+        if reported != realized_value:
+            _cat_record(idx, actor, reported, frame, vote=True, outcome=False)
+
+
+def category_report_weight(idx: "Index", actor: str, value: str,
+                           frame: str = FACT_FRAME) -> float:
+    """Read-time per-(actor, value) discount for the categorical predictive.
+
+    Weights an actor's count of value `v` by how trustworthy its reports of `v`
+    have proven under settlement (§4.2), on [0, 1]:
+
+      * NO settlement evidence for (actor, value) ⇒ weight = 1.0 exactly, so the
+        C3 seam is a byte-for-byte no-op over the C2 raw-count posterior.
+      * Otherwise the EXISTING two-coin log_lr over the per-value confusion gives
+        the positive-vote evidence an "I reported v" vote carries; mapped to an
+        odds-ratio RELATIVE to the newcomer prior and capped at 1.0. An actor no
+        worse than a newcomer keeps weight ~1.0; a value-randomiser, whose reports
+        of v miss (low sensitivity) or are wrong (false positives for v), is
+        discounted. The confusion two-coin (not response_log_lr) is used because
+        a single settlement scores a proposition with only True-outcome events
+        (truth WAS v* for every observation) — its asymmetric sens/fpr priors keep
+        an honest reporter near weight 1.0, where the graded response distribution,
+        needing both true and false events, would spuriously punish it.
+    """
+    key = _cat_key(actor, value)
+    conf = confusion(idx, key, frame)
+    if conf == (0, 0, 0, 0):
+        return 1.0
+    lr = log_lr(*rates(conf), True)
+    return min(1.0, math.exp(lr - PRIOR_LOG_LR))
