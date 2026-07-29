@@ -164,7 +164,23 @@ class CandorSystem:
         # events), in true ledger order — no post-fold re-application (I3).
         # Replay determinism: flags/questions/breadth are a deterministic
         # function of the folded observations, so re-derive them here.
-        curiosity_mod.sweep(self.index)
+        #
+        # H6b: the restored snapshot is POST-sweep, so only facts with a NEW
+        # observation in the tail can have a changed verdict. On the fast path
+        # re-sweep just those (each from its full observation set — provably ==
+        # a full sweep for them); untouched facts keep their snapshot verdict.
+        # On a full-from-genesis fold (start_seq==0, incl. every retraction/
+        # redaction/restore fallback) the index is blank, so we FULL-sweep.
+        if start_seq > 0:
+            touched = [r["fact_id"] for r in self.index.query(
+                "SELECT DISTINCT fact_id FROM observations "
+                "WHERE event_seq > ? AND fact_id IS NOT NULL ORDER BY fact_id",
+                (start_seq,))]
+            curiosity_mod.resweep(self.index, touched)
+            self._last_resweep_ids = touched
+        else:
+            curiosity_mod.sweep(self.index)
+            self._last_resweep_ids = None
         self.index.commit()
         self._closure = None
 
@@ -253,6 +269,19 @@ class CandorSystem:
                 payload = (None if silenced or ev.payload_hash in redacted
                            else self.ledger.payload(ev.payload_hash))
                 apply_mod.apply_event(tmp_index, ev, payload)
+            # H6b: snapshot the POST-sweep state so a fast-path open() restores
+            # verdicts and re-sweeps only tail-touched facts. Sweep incrementally
+            # here too when we reused an earlier (already-swept) checkpoint, so
+            # building a fresh checkpoint stays O(tail) on the sweep as well.
+            if start_seq > 0:
+                touched = [r["fact_id"] for r in tmp_index.query(
+                    "SELECT DISTINCT fact_id FROM observations "
+                    "WHERE event_seq > ? AND fact_id IS NOT NULL ORDER BY fact_id",
+                    (start_seq,))]
+                curiosity_mod.resweep(tmp_index, touched)
+            else:
+                curiosity_mod.sweep(tmp_index)
+            tmp_index.commit()
             tmp_index.snapshot_to(dest)
             tmp_index.close()
             return head
@@ -1108,6 +1137,9 @@ class CandorSystem:
     # _refold folded, and the checkpoint seq it restored from (0 = full replay).
     _last_tail_folded: int = 0
     _last_checkpoint_seq: int = 0
+    # H6b sweep instrumentation: the fact ids the last _refold RE-SWEPT on the
+    # incremental fast path (the tail-touched ones); None marks a full sweep.
+    _last_resweep_ids: Optional[list[str]] = None
 
     # ── test-only fault injection (§6.1) ─────────────────────────────────────
     def corrupt(self, what: str, arg: str = "") -> None:

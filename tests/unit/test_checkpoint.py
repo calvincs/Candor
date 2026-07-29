@@ -128,20 +128,22 @@ def test_all_kinds_checkpoint_equals_full_replay(tmp_path):
     m2.close()
 
 
-def test_snapshot_is_pre_sweep_and_pre_closure(tmp_path):
-    """The correctness pivot: the snapshot freezes the folded state BEFORE the
-    curiosity sweep (which sets dispersion_flag monotonically and never clears
-    it). The live store has swept state; the snapshot must not, so the reopened
-    store re-sweeps over the complete observation set."""
+def test_snapshot_is_post_sweep_and_pre_closure(tmp_path):
+    """H6b: the snapshot now freezes the POST-sweep state, so a fast-path open()
+    can restore verdicts and re-sweep only tail-touched facts. Its dispersion
+    flags / breadth must therefore MATCH the live swept store (byte-for-byte over
+    the swept columns), while it stays PRE-closure (closure is rebuilt lazily, so
+    no materialized atoms leak into the cache)."""
     import sqlite3
     root = tmp_path / "store"
     m = CandorSystem(root)
     _rich_burst(m, "p1")
     head = m.ledger_head()
     # The live, swept store has breadth classified on its 40-obs frequency fact.
-    live_breadth = m.index.query(
-        "SELECT breadth_class FROM facts WHERE breadth_class IS NOT NULL")
-    assert live_breadth, "expected the live sweep to classify at least one fact"
+    live = {r["id"]: (r["dispersion_flag"], r["breadth_class"]) for r in m.index.query(
+        "SELECT id, dispersion_flag, breadth_class FROM facts")}
+    assert any(bc is not None for _, bc in live.values()), \
+        "expected the live sweep to classify at least one fact"
     m.checkpoint()
     m.close()
 
@@ -149,12 +151,14 @@ def test_snapshot_is_pre_sweep_and_pre_closure(tmp_path):
     assert snap.exists()
     db = sqlite3.connect(str(snap))
     db.row_factory = sqlite3.Row
-    flagged = db.execute("SELECT COUNT(*) c FROM facts WHERE dispersion_flag!=0").fetchone()["c"]
-    breadth = db.execute("SELECT COUNT(*) c FROM facts WHERE breadth_class IS NOT NULL").fetchone()["c"]
+    snap_verdicts = {r["id"]: (r["dispersion_flag"], r["breadth_class"])
+                     for r in db.execute(
+                         "SELECT id, dispersion_flag, breadth_class FROM facts")}
     atoms = db.execute("SELECT COUNT(*) c FROM closure_atoms").fetchone()["c"]
     db.close()
-    assert flagged == 0, "snapshot carries swept dispersion flags (not pre-sweep)"
-    assert breadth == 0, "snapshot carries swept breadth (not pre-sweep)"
+    assert snap_verdicts == live, "snapshot verdicts != live swept state (not post-sweep)"
+    assert any(dv != 0 or bc is not None for dv, bc in snap_verdicts.values()), \
+        "snapshot carries no swept verdicts at all (vacuous)"
     assert atoms == 0, "snapshot carries materialized closure (not pre-closure)"
 
 
@@ -428,3 +432,121 @@ def test_empty_ledger_checkpoint_is_a_noop(tmp_path):
     assert not (root / "checkpoints").exists() or not list(
         (root / "checkpoints").glob("*.sqlite3"))
     m.close()
+
+
+# ══ H6b: INCREMENTAL curiosity sweep on the checkpoint fast path ════════════════
+# The verdict a full sweep gives fact F is a pure function of F's own observations,
+# so a fast-path open() can restore the post-sweep snapshot and re-sweep ONLY the
+# facts a tail observation touched. Every test here still pins the whole derived
+# state to a forced full-from-genesis replay (which full-sweeps): byte-identical
+# or it fails.
+
+def _dispersing_store(root):
+    """A store whose 'dispersed' frequency fact overdisperses on an elevation
+    covariate, plus an 'other' fact that does not. Deterministic (seeded)."""
+    m = CandorSystem(root)
+    m.set_actor_quota("tool:probe", obs_per_epoch=100_000, cand_per_epoch=100_000)
+    for p in ("dispersed", "other"):
+        m.assert_({"pred": p, "args": ["c", "d"], "stmt_type": "frequency"},
+                  source="s", actor="human:me")
+    m.run_gate()
+    return m
+
+
+def _observe_split(m, pred, n, rng):
+    stmt = {"pred": pred, "args": ["c", "d"]}
+    for i in range(n):
+        elev = "high" if i % 2 else "sea"
+        theta = 0.35 if elev == "high" else 0.90        # delta=0.55 overdispersion
+        m.observe(stmt, rng.random() < theta, {"elevation": elev}, actor="tool:probe")
+
+
+def test_fact_newly_dispersed_after_tail_matches_full_replay(tmp_path):
+    """A fact that becomes dispersed ONLY after tail observations: it is tail-
+    touched, so the fast path must re-sweep it and reach the same verdict as a
+    full replay of the complete observation set."""
+    root = tmp_path / "store"
+    m = _dispersing_store(root)
+    stmt = {"pred": "dispersed", "args": ["c", "d"]}
+    for i in range(30):                     # before ckpt: one context, stable rate
+        m.observe(stmt, i % 10 < 7, {"elevation": "sea"}, actor="tool:probe")
+    m.run_gate()
+    fid = m.index.one("SELECT id FROM facts WHERE pred='dispersed'")["id"]
+    assert not m.index.one("SELECT dispersion_flag d FROM facts WHERE id=?", (fid,))["d"], \
+        "fact was already dispersed before the tail (vacuous)"
+    s_cp = m.ledger.seq()
+    m.checkpoint()
+    _observe_split(m, "dispersed", 120, random.Random(11))   # tail introduces it
+    m.close()
+
+    m2 = CandorSystem(root)
+    assert m2._last_checkpoint_seq == s_cp
+    assert fid in (m2._last_resweep_ids or []), "newly-dispersed fact was not re-swept"
+    assert m2.index.one("SELECT dispersion_flag d FROM facts WHERE id=?", (fid,))["d"], \
+        "fast path missed the dispersion the tail introduced"
+    _assert_checkpoint_equals_full_replay(m2, expect_fast=True)
+    m2.close()
+
+
+def test_fact_dispersed_before_checkpoint_stays_flagged_when_untouched(tmp_path):
+    """THE MONOTONIC-FLAG PIVOT. A fact dispersed BEFORE the checkpoint and left
+    untouched by the tail must keep its verdict from the (post-sweep) snapshot
+    without being re-swept, while a different fact grows in the tail — matching a
+    full replay byte-for-byte."""
+    root = tmp_path / "store"
+    m = _dispersing_store(root)
+    _observe_split(m, "dispersed", 120, random.Random(11))   # disperse before ckpt
+    other = {"pred": "other", "args": ["c", "d"]}
+    for _ in range(20):
+        m.observe(other, True, {"x": "1"}, actor="tool:probe")
+    m.run_gate()
+    dfid = m.index.one("SELECT id FROM facts WHERE pred='dispersed'")["id"]
+    ofid = m.index.one("SELECT id FROM facts WHERE pred='other'")["id"]
+    assert m.index.one("SELECT dispersion_flag d FROM facts WHERE id=?", (dfid,))["d"], \
+        "the 'dispersed' fact never dispersed (vacuous)"
+    s_cp = m.ledger.seq()
+    m.checkpoint()
+    for _ in range(20):                     # tail touches ONLY 'other'
+        m.observe(other, True, {"x": "1"}, actor="tool:probe")
+    m.close()
+
+    m2 = CandorSystem(root)
+    assert m2._last_checkpoint_seq == s_cp
+    reswept = m2._last_resweep_ids or []
+    assert dfid not in reswept, "untouched dispersed fact was needlessly re-swept"
+    assert ofid in reswept, "tail-touched fact was not re-swept"
+    assert m2.index.one("SELECT dispersion_flag d FROM facts WHERE id=?", (dfid,))["d"], \
+        "untouched dispersed fact lost its flag (snapshot was not post-sweep)"
+    _assert_checkpoint_equals_full_replay(m2, expect_fast=True)
+    m2.close()
+
+
+def test_only_tail_touched_facts_are_reswept(tmp_path):
+    """O(touched), not O(all): with many swept facts, adding tail observations to
+    exactly ONE re-sweeps only that one."""
+    root = tmp_path / "store"
+    m = CandorSystem(root)
+    m.set_actor_quota("tool:probe", obs_per_epoch=100_000, cand_per_epoch=100_000)
+    for i in range(8):
+        m.assert_({"pred": f"f{i}", "args": ["c", "d"], "stmt_type": "frequency"},
+                  source="s", actor="human:me")
+    m.run_gate()
+    rng = random.Random(5)
+    for i in range(8):
+        st = {"pred": f"f{i}", "args": ["c", "d"]}
+        for _ in range(20):                 # >= MIN_OBS so every fact is swept
+            m.observe(st, rng.random() < 0.6, {"x": "1"}, actor="tool:probe")
+    m.run_gate()
+    s_cp = m.ledger.seq()
+    m.checkpoint()
+    tfid = m.index.one("SELECT id FROM facts WHERE pred='f3'")["id"]
+    for _ in range(5):
+        m.observe({"pred": "f3", "args": ["c", "d"]}, True, {"x": "1"}, actor="tool:probe")
+    m.close()
+
+    m2 = CandorSystem(root)
+    assert m2._last_checkpoint_seq == s_cp
+    assert m2._last_resweep_ids == [tfid], (
+        f"expected only f3 re-swept, got {m2._last_resweep_ids}")
+    _assert_checkpoint_equals_full_replay(m2, expect_fast=True)   # calls replay() last
+    m2.close()

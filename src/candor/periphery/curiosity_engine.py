@@ -81,7 +81,13 @@ def _mdl_fields(groups: dict[str, C.Group]) -> dict[str, float]:
 
 
 def sweep(idx) -> list[tuple[str, dict[str, Any]]]:
-    """Return (candidate_kind, body) proposals; also set flags/questions."""
+    """FULL sweep: (re)derive every fact's verdict from its own observations.
+
+    Returns (candidate_kind, body) proposals; also sets each fact's dispersion
+    flag / breadth / open question. A fact's verdict is a pure function of that
+    fact's OWN observations and context (nothing here reads across facts), which
+    is exactly what lets `resweep` re-derive one fact in isolation and match this.
+    """
     proposals: list[tuple[str, dict[str, Any]]] = []
     # The sweep is a memoryless detector over the raw observation log: a
     # persisting pattern is re-proposed every sweep (gate application is
@@ -91,12 +97,50 @@ def sweep(idx) -> list[tuple[str, dict[str, Any]]]:
         "SELECT f.id, f.pred, f.args_json, f.stmt_type FROM facts f "
         "ORDER BY f.id")
     for fact in facts:
-        rows = idx.query(
-            "SELECT o.event_seq, o.outcome, e.ts FROM observations o "
-            "JOIN events e ON e.seq = o.event_seq WHERE o.fact_id=? "
-            "ORDER BY o.event_seq", (fact["id"],))
-        if len(rows) < MIN_OBS:
+        proposals.extend(_sweep_fact(idx, fact))
+    return proposals
+
+
+def resweep(idx, fact_ids) -> list[tuple[str, dict[str, Any]]]:
+    """INCREMENTAL sweep: re-derive ONLY the given facts' verdicts (H6b).
+
+    On the checkpoint fast path the restored snapshot is POST-sweep, so a fact's
+    verdict is already correct UNLESS the folded tail added an observation to it.
+    Re-deriving just those tail-touched facts — each from its FULL observation set
+    — is byte-identical to a full sweep for them (a verdict depends only on the
+    fact's own observations), while untouched facts keep their snapshot verdict.
+    O(touched), not O(all facts).
+
+    Because a re-derivation must be able to DOWNGRADE a fact (the sweep only ever
+    SETS dispersion_flag and always (re)writes breadth), each fact's prior verdict
+    is wiped first, then recomputed. On a from-scratch full replay the same facts
+    start blank, so `sweep` needs no such wipe and stays byte-for-byte as before.
+    """
+    proposals: list[tuple[str, dict[str, Any]]] = []
+    for fid in fact_ids:
+        fact = idx.one(
+            "SELECT id, pred, args_json, stmt_type FROM facts WHERE id=?", (fid,))
+        if fact is None:
             continue
+        idx.execute(
+            "UPDATE facts SET dispersion_flag=0, breadth_class=NULL WHERE id=?",
+            (fid,))
+        idx.execute(
+            "DELETE FROM open_questions WHERE kind='dispersion' AND target_id=?",
+            (fid,))
+        proposals.extend(_sweep_fact(idx, fact))
+    return proposals
+
+
+def _sweep_fact(idx, fact) -> list[tuple[str, dict[str, Any]]]:
+    """Derive one fact's verdict from its full observation set. Pure in the
+    fact's own observations/context — the unit shared by `sweep` and `resweep`."""
+    proposals: list[tuple[str, dict[str, Any]]] = []
+    rows = idx.query(
+        "SELECT o.event_seq, o.outcome, e.ts FROM observations o "
+        "JOIN events e ON e.seq = o.event_seq WHERE o.fact_id=? "
+        "ORDER BY o.event_seq", (fact["id"],))
+    if len(rows) >= MIN_OBS:
         series = [bool(r["outcome"]) for r in rows]
         ctx_rows = idx.query(
             "SELECT oc.event_seq, oc.key, oc.value FROM obs_context oc "
