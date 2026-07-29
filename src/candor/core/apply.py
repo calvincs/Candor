@@ -85,7 +85,7 @@ def _apply_assertion(idx: "Index", ev: "Event", payload: dict[str, Any]) -> None
         "VALUES(?,?,?,?,?,?,'pending',NULL,NULL,NULL)",
         (candidate_id_for(ev.seq), ev.seq, payload["candidate_kind"],
          canon_json(payload["body"]), ev.source_ref, ev.actor))
-    _bump_quota(idx, ev.actor, "candidate")
+    _bump_quota(idx, ev.actor, "candidate", epoch_of(ev.ts))
 
 
 def _apply_admission(idx: "Index", ev: "Event", payload: dict[str, Any]) -> None:
@@ -207,7 +207,7 @@ def _apply_observation(idx: "Index", ev: "Event", payload: dict[str, Any]) -> No
         idx.execute(
             "INSERT OR REPLACE INTO obs_context(event_seq, key, value) VALUES(?,?,?)",
             (ev.seq, str(key), str(cval)))
-    _bump_quota(idx, ev.actor, "observation")
+    _bump_quota(idx, ev.actor, "observation", epoch_of(ev.ts))
     # Pin tension is a boolean-outcome semantics; a categorical observation has no
     # true/false outcome to contradict a '-' pin, so it is skipped for those.
     if fid is not None and not categorical:
@@ -385,6 +385,22 @@ _HANDLERS = {
 
 
 # ── derived bookkeeping ─────────────────────────────────────────────────────
+
+# §3.12 quota epoch length, in milliseconds (one day). Quotas are per-epoch:
+# an actor gets a fresh budget each epoch instead of a lifetime cap. The epoch
+# of an event is a pure function of its timestamp — which lives in the ledger —
+# so replay reproduces every bucket exactly. Like the fsync policy and the
+# configured limits, this is deployment config, NOT part of the closure hash
+# (quota_usage is absent from _HASH_QUERIES), so tuning it moves no replay
+# number. A live burst (default wall-clock ts) stays inside one epoch, so the
+# historical flooding bound is unchanged.
+QUOTA_EPOCH_MS = 86_400_000
+
+
+def epoch_of(ts_ms: int) -> int:
+    """The quota epoch an event at `ts_ms` (ms since the Unix epoch) falls in."""
+    return int(ts_ms) // QUOTA_EPOCH_MS
+
 
 def _bump_quota(idx: "Index", actor: str, kind: str, epoch: int = 0) -> int:
     idx.execute(

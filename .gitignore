@@ -3,6 +3,11 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .hypothesis/
+
+# Local agent/editor state: Claude Code keeps per-session settings and git
+# worktrees under .claude/. It is machine-local scaffolding, never a project
+# artifact, so keep it out of the repo entirely.
+.claude/
 # All benchmark/run data stays local: corpora and observation streams are
 # derived from private sources and must never be committed.
 data/

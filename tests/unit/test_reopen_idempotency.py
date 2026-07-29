@@ -24,10 +24,12 @@ def _build_store(root):
 
 
 def _quota_used(m, actor, kind="observation"):
+    # Sum across epoch buckets: quotas are per-epoch (M2), and a live burst may
+    # straddle a boundary. Total usage is what must not double across a reopen.
     row = m.index.one(
-        "SELECT used FROM quota_usage WHERE actor=? AND epoch=0 AND kind=?",
+        "SELECT SUM(used) AS used FROM quota_usage WHERE actor=? AND kind=?",
         (actor, kind))
-    return int(row["used"]) if row else 0
+    return int(row["used"]) if row and row["used"] is not None else 0
 
 
 def test_reopen_does_not_double_count(tmp_path):
