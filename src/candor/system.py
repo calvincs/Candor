@@ -881,6 +881,14 @@ class CandorSystem:
                 caveats.add("under_specified")
             if states[target].narrow:
                 caveats.add("narrow_breadth")
+            # H8b: a crisp fact whose votes alternate is FLAKY — the prediction
+            # took the grouped-by-key path, and its instability may not trip the
+            # overdispersion sweep (a single-context alternating fact has no
+            # covariate and no block-scale spread), so surface it explicitly or
+            # flakiness stays silent — the whole point of detecting it. Pure
+            # function of the votes, so predict_at reproduces it (I8).
+            if states[target].votes and predict_mod.is_flaky(states[target].votes):
+                caveats.add("unstable")
         if any(v >= 2 for v in sources.values()) and len(needed) >= 2:
             caveats.add("shared_provenance")
         return predict_mod.Problem(fid, dnf, states, groups, caveats, confusion,

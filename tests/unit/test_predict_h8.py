@@ -119,7 +119,7 @@ def _random_votes(rng):
 
 
 @pytest.mark.parametrize("seed", range(40))
-def test_draw_output_is_bit_identical_old_vs_new(seed):
+def test_draw_output_matches_reference_old_vs_new(seed):
     rng = random.Random(1000 + seed)
     s = 512
     actors, votes = _random_votes(rng)
@@ -138,9 +138,84 @@ def test_draw_output_is_bit_identical_old_vs_new(seed):
                                            discounts)
     new = P._draw(state, s, actor_params, lr_table, discounts)
 
-    assert list(new.truth) == old_t
     assert _bits(new.theta) == _bits(old_th)
-    assert _bits(new.cont) == _bits(old_c)          # every rounded bit unchanged
+    if P.is_flaky(votes):
+        # H8b flaky path (grouped BY KEY): a deterministic reassociation of the
+        # exact fold, so the continuous mass matches the old per-vote fold up to
+        # float reassociation (~1e-14), NOT bit-for-bit — and re-running _draw
+        # reproduces it exactly (replay-stable).
+        again = P._draw(state, s, actor_params, lr_table, discounts)
+        assert _bits(new.cont) == _bits(again.cont)
+        assert list(new.truth) == list(again.truth)
+        for a, b in zip(new.cont, old_c):
+            assert abs(a - b) < 1e-9, (a, b)
+    else:
+        # Stable / contiguous path (exact fold): bit-for-bit unchanged. The flaky
+        # path must never perturb a stable fact.
+        assert list(new.truth) == old_t
+        assert _bits(new.cont) == _bits(old_c)      # every rounded bit unchanged
+
+
+# ── flaky path: exactly the by-key naive fold, and it fires on alternation ────
+def _naive_grouped_crisp_draw(state, s, actor_params, response_lr, discounts):
+    """Reference: sum each vote CLASS's contribution over its total count with a
+    plain running add, in `_by_key_class` order. `_fold_add` is bit-identical to
+    the naive fold (see above), so `_draw`'s flaky path must match this exactly."""
+    perm_u = P.permutation(state.fact_id + "|bernoulli", s)
+    unit = P._unit_grid(s)
+    lr_table = response_lr or {}
+    classes = P._by_key_class(state.votes)
+    truth, cont = [], []
+    for i in range(s):
+        groups, sizes, singles = {}, {}, 0.0
+        for actor, vote, grade, sig, count in classes:
+            if grade > 0 and (actor, vote, grade) in lr_table:
+                contribution = lr_table[(actor, vote, grade)]
+            else:
+                contribution = log_lr(actor_params[actor][0][i],
+                                      actor_params[actor][1][i], bool(vote))
+            if discounts:
+                contribution = temper(contribution, discounts.get(actor, 1.0))
+            if sig is None:
+                singles = _naive_fold(singles, contribution, count)
+            else:
+                groups[sig] = _naive_fold(groups.get(sig, 0.0), contribution, count)
+                sizes[sig] = sizes.get(sig, 0) + count
+        logodds = singles + sum(sub / (sizes[g] ** GAMMA) for g, sub in groups.items())
+        p = 1.0 / (1.0 + math.exp(-max(-60.0, min(60.0, logodds))))
+        cont.append(p)
+        truth.append(1 if unit[perm_u[i]] < p else 0)
+    return truth, [1.0] * s, cont
+
+
+def test_is_flaky_classifies_alternating_but_not_stable_or_changepoint():
+    # stable long run → one run, one class → not flaky
+    assert not P.is_flaky(tuple(("a", 1, 0, "c") for _ in range(3200)))
+    # one-way changepoint → two runs, two classes → not flaky (2 !> 2*2)
+    assert not P.is_flaky(tuple(("a", 1, 0, "c") for _ in range(50))
+                          + tuple(("a", 0, 0, "c") for _ in range(50)))
+    # alternating one actor/context → many runs, two classes → flaky
+    alt = tuple(("a", i % 2, 0, "c") for i in range(200))
+    assert P.is_flaky(alt)
+    # a handful of distinct votes, once each → runs == classes → not flaky
+    assert not P.is_flaky((("a", 1, 0, None), ("a", 0, 0, None), ("b", 1, 0, "c")))
+
+
+def test_flaky_draw_is_exactly_the_by_key_naive_fold():
+    s = 512
+    rng = random.Random(4242)
+    # alternating across two contexts and two actors, modest counts so the naive
+    # reference stays cheap; interleaved so contiguous runs are length 1.
+    votes = tuple((f"actor:{i % 2}", i % 2, 0, "ctx:z" if i % 3 else None)
+                  for i in range(120))
+    assert P.is_flaky(votes)
+    actor_params = _actor_params({"actor:0", "actor:1"}, s, rng)
+    state = P.FactState("fact:one", "crisp", (99.0, 1.0), (1.0, 1.0), votes=votes)
+    new = P._draw(state, s, actor_params, {}, {})
+    ref_t, ref_th, ref_c = _naive_grouped_crisp_draw(state, s, actor_params, {}, {})
+    assert list(new.truth) == ref_t
+    assert _bits(new.theta) == _bits(ref_th)
+    assert _bits(new.cont) == _bits(ref_c)          # every rounded bit matches
 
 
 # ── flat scaling in the number of duplicate observations ─────────────────────
@@ -165,3 +240,22 @@ def test_crisp_draw_latency_is_flat_in_duplicate_count():
     # cost ~400x. Collapsed to one run it is within a small constant of the
     # 8-vote case. Generous bound to stay non-flaky, but far below linear (400x).
     assert big < small * 8, f"small={small*1e3:.2f}ms big={big*1e3:.2f}ms"
+
+
+# ── H8b: flat scaling on a FLAKY (alternating) fact ──────────────────────────
+def _alt_state(n):
+    """Alternating one-actor/one-context outcomes: contiguous runs of length 1,
+    so H8's run-collapse buys nothing and only H8b's by-key grouping flattens it."""
+    votes = tuple(("actor:x", i % 2, 0, "ctx:z") for i in range(n))
+    return P.FactState("fact:one", "crisp", (99.0, 1.0), (1.0, 1.0), votes=votes)
+
+
+def test_flaky_crisp_draw_latency_is_flat_in_observation_count():
+    assert P.is_flaky(_alt_state(200).votes)
+    ap = {"actor:x": ([0.9] * 512, [0.1] * 512)}
+    small = _time_draw(_alt_state(100), ap)
+    big = _time_draw(_alt_state(3200), ap)
+    # 3200 alternating observations is 32x the data of 100 and collapses to runs
+    # of length 1 — a per-vote (or per-run) loop would cost ~32x. Grouped BY KEY
+    # it is O(2 classes) per world, flat. Generous bound, far below linear.
+    assert big < small * 5, f"small={small*1e3:.2f}ms big={big*1e3:.2f}ms"

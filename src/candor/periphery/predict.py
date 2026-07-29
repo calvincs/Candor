@@ -193,6 +193,56 @@ def _vote_runs(votes: tuple[tuple[str, int, int, Optional[str]], ...]
     return runs
 
 
+#: H8b: how many more contiguous runs than distinct vote CLASSES a crisp fact
+#: must have before it is judged "flaky". At 2×, a stable fact (long same-outcome
+#: runs → runs ≈ classes) and a one-way changepoint (two runs, two classes) both
+#: stay on the exact contiguous fold; an alternating/oscillating fact (runs ≈
+#: votes ≫ classes) trips it.
+FLAKY_RUN_FACTOR = 2
+
+
+def is_flaky(votes: tuple[tuple[str, int, int, Optional[str]], ...]) -> bool:
+    """Does this crisp fact's vote sequence barely collapse into contiguous runs?
+
+    H8 flattens a *stable* crisp fact (long same-outcome runs) to O(runs) per
+    world, but an *alternating* one degenerates back to O(observations): every
+    run has length 1, so the contiguous fold saves nothing. Such a fact is, by
+    construction, uncertain — spending bit-precision on it is pointless. This is
+    the cheap, DETERMINISTIC detector: compare the run count to the number of
+    distinct (actor, vote, grade, context_sig) classes. It is a pure function of
+    the folded votes, so a replay classifies identically and `predict_at`
+    reproduces both the path taken and the number produced (I8). When it fires,
+    `_draw` groups votes BY KEY (flat, O(classes) per world) and the caller
+    surfaces an ``unstable`` caveat.
+    """
+    runs = _vote_runs(votes)
+    n_classes = len({(a, v, g, s) for a, v, g, s, _ in runs})
+    return n_classes > 0 and len(runs) > FLAKY_RUN_FACTOR * n_classes
+
+
+def _by_key_class(votes: tuple[tuple[str, int, int, Optional[str]], ...]
+                  ) -> list[list]:
+    """Votes summed BY KEY across the whole (possibly interleaved) sequence, as
+    ``[actor, vote, grade, sig, total_count]`` in a deterministic order.
+
+    Unlike `_vote_runs` this merges every occurrence of a key regardless of
+    interleaving, so a per-world fold over these is O(distinct classes), not
+    O(runs). Folding a key's contribution over its TOTAL count reassociates the
+    additions relative to the contiguous fold, so the logodds differ by ~1e-14 —
+    deterministic (a pure function of the votes), just not bit-identical to the
+    exact fold. The per-context group SIZE (the sub-additive denominator) is the
+    same integer either way, so only the numerator's last bits move.
+    """
+    merged: dict[tuple[str, int, int, Optional[str]], int] = {}
+    for actor, vote, grade, sig in votes:
+        key = (actor, vote, grade, sig)
+        merged[key] = merged.get(key, 0) + 1
+    return [[a, v, g, s, c] for (a, v, g, s), c in sorted(
+        merged.items(),
+        key=lambda kv: (kv[0][0], "" if kv[0][3] is None else "z" + kv[0][3],
+                        kv[0][1], kv[0][2]))]
+
+
 def _unit_grid(s: int) -> list[float]:
     grid = _UNIT_GRID_CACHE.get(s)
     if grid is None:
@@ -254,15 +304,23 @@ def _draw(state: FactState, s: int,
         # so we collapse maximal runs ONCE and fold each run's contribution by
         # its count — the per-world loop is O(distinct runs), not O(votes), and
         # bit-identical to the per-vote fold (see `_fold_add`).
+        #
+        # H8b: on a FLAKY fact the outcomes interleave, so contiguous runs barely
+        # collapse and the fold is O(observations) again. There we group votes BY
+        # KEY instead (O(distinct classes) per world) — deterministic, ~1e-14 off
+        # the exact fold, never bit-identical to it. `is_flaky` is a pure function
+        # of the votes, so the choice replays identically; the flaky path never
+        # touches a stable fact, whose output stays bit-for-bit unchanged.
         lr_table = response_lr or {}
-        runs = _vote_runs(state.votes)
+        items = (_by_key_class(state.votes) if is_flaky(state.votes)
+                 else _vote_runs(state.votes))
         truth = []
         cont = []
         for i in range(s):
             groups: dict[str, float] = {}
             sizes: dict[str, int] = {}
             singles = 0.0
-            for actor, vote, grade, sig, count in runs:
+            for actor, vote, grade, sig, count in items:
                 if grade > 0 and (actor, vote, grade) in lr_table:
                     contribution = lr_table[(actor, vote, grade)]   # Δ6 mean LR
                 else:
