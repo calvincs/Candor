@@ -173,27 +173,41 @@ def category_posterior(idx: "Index", fact_id: str,
     the whole distribution is order-insensitive and reproduces bit-for-bit under
     `predict_at` (I3/I8).
     """
+    # C3: compose per (actor, value), so the one-vs-rest reliability DISCOUNT can
+    # multiply into each actor's contribution — the categorical analog of
+    # compose() weighting each actor's counts by reliability.expected(actor).
+    # Iteration is ORDER BY value, actor: values stay in canonical order (unknown
+    # last) and the per-value float accumulation over actors is fixed, so the
+    # whole distribution is order-insensitive and reproduces bit-for-bit (I3/I8).
+    # A never-settled (actor, value) weights at EXACTLY 1.0, so an un-scored store
+    # reduces to the C2 raw-count posterior byte-for-byte.
     rows = idx.query(
-        "SELECT value, SUM(n) AS n FROM fact_category_counts WHERE fact_id=? "
-        "GROUP BY value ORDER BY value", (fact_id,))
-    # C2 composes over RAW integer counts, summed across actors. <SEAM for C3>:
-    # the per-value one-vs-rest reliability DISCOUNT multiplies into n_v exactly
-    # here — the categorical analog of compose() weighting each actor's counts by
-    # reliability.expected(actor). v1 keeps every actor's weight at 1.0.
-    counts = [(r["value"], int(r["n"])) for r in rows if int(r["n"]) > 0]
-    total = sum(n for _, n in counts)
+        "SELECT actor, value, SUM(n) AS n FROM fact_category_counts WHERE fact_id=? "
+        "GROUP BY value, actor ORDER BY value, actor", (fact_id,))
+    discounted: dict[str, float] = {}   # value → Σ_actor weight(actor,value)·n_v
+    raw_total = 0                        # raw observation count (I11 truth)
+    for r in rows:
+        n = int(r["n"])
+        if n <= 0:
+            continue
+        raw_total += n
+        value = r["value"]
+        weight = reliability.category_report_weight(idx, r["actor"], value)
+        discounted[value] = discounted.get(value, 0.0) + weight * n
+    counts = [(value, dn) for value, dn in discounted.items() if dn > 0]
+    total = sum(dn for _, dn in counts)   # discounted effective N (drives denom)
     denom = float(total) + alpha
 
     values: dict[str, CategoricalSlice] = {}
     seen_mass = 0.0
-    for value, n in counts:
-        p = n / denom
+    for value, dn in counts:
+        p = dn / denom
         seen_mass += p
-        lo = betaincinv(float(n), denom - n, CAT_CI_LO)
-        hi = betaincinv(float(n), denom - n, CAT_CI_HI)
+        lo = betaincinv(float(dn), denom - dn, CAT_CI_LO)
+        hi = betaincinv(float(dn), denom - dn, CAT_CI_HI)
         values[value] = CategoricalSlice(p, (lo, hi))
 
-    if total == 0:
+    if raw_total == 0:
         # Never observed: the whole predictive mass is the unknown category.
         # Beta(alpha, 0) is degenerate, so report a point interval at 1.0.
         unknown = CategoricalSlice(1.0, (1.0, 1.0))
@@ -208,7 +222,10 @@ def category_posterior(idx: "Index", fact_id: str,
         hi = betaincinv(alpha, float(total), CAT_CI_HI)
         unknown = CategoricalSlice(p_unknown, (lo, hi))
 
-    return CategoricalPosterior(values, unknown, total)
+    # total_observations reports the RAW integer count (never the discounted
+    # effective N): it is a fact-level tally, and predict()'s no_observations
+    # caveat keys on it being truly zero.
+    return CategoricalPosterior(values, unknown, raw_total)
 
 
 def apply_rule_observation(idx: "Index", rule_id: str, actor: str,

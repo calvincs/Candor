@@ -153,6 +153,11 @@ CREATE TABLE IF NOT EXISTS claims(
   certainty_class TEXT CHECK(certainty_class IN
     ('certain','high','estimated','unlicensed')),
   resolved_ts INTEGER, outcome INTEGER, surprisal REAL,
+  -- v0.5 (categorical C3): a categorical claim is a DISTRIBUTION, not a scalar
+  -- predicted_p. Its full frozen predictive (the C2 CategoricalPrediction, as
+  -- {"values": {v: p}, "unknown": p}) is snapshot-pinned here so resolution can
+  -- score the realised value's surprisal against it. NULL for crisp/frequency.
+  predicted_dist_json TEXT,
   CHECK (settlement = 'unsettleable' OR verifier_id IS NOT NULL));
 CREATE TABLE IF NOT EXISTS proof_steps(
   claim_id TEXT, step_no INTEGER, rule_id TEXT, fact_id TEXT, edge_kind TEXT,

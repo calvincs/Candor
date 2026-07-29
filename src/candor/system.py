@@ -632,17 +632,37 @@ class CandorSystem:
             return REFUSED
         pred = self.predict(stmt, budget=10_000)
         claim_id = f"claim:{self.ledger.seq() + 1}"
-        payload = {
+        base = {
             "claim_id": claim_id,
             "stmt": {"pred": stmt["pred"], "args": list(stmt["args"])},
             "frame": frame, "settlement": settlement, "criterion": criterion,
             "verifier_id": verifier_id, "due": due,
-            "predicted_p": pred.p, "ci_lo": pred.ci[0], "ci_hi": pred.ci[1],
-            "model_snapshot": pred.snapshot_id,
-            "predictor_class": calibration_mod.DEFAULT_PREDICTOR_CLASS,
             "certainty_class": self._certainty_class(settlement, verifier_id),
-            "sensitivity": pred.sensitivity,
         }
+        if isinstance(pred, CategoricalPrediction):
+            # A categorical claim is a DISTRIBUTION, not a scalar p (design §4.1):
+            # freeze the full C2 predictive into the payload (snapshot-pinned, I8)
+            # so resolution can score −log P(v*) — including the reserved unknown
+            # slice for a never-seen v*. Distinct predictor_class ⇒ never pools
+            # with binary calibration (I9). Leaf query ⇒ no proof-sensitivity.
+            payload = {
+                **base,
+                "predicted_p": None, "ci_lo": None, "ci_hi": None,
+                "predicted_dist": {
+                    "values": {v: s.p for v, s in pred.values.items()},
+                    "unknown": pred.unknown.p},
+                "model_snapshot": pred.snapshot_id,
+                "predictor_class": calibration_mod.CATEGORICAL_PREDICTOR_CLASS,
+                "sensitivity": {},
+            }
+        else:
+            payload = {
+                **base,
+                "predicted_p": pred.p, "ci_lo": pred.ci[0], "ci_hi": pred.ci[1],
+                "model_snapshot": pred.snapshot_id,
+                "predictor_class": calibration_mod.DEFAULT_PREDICTOR_CLASS,
+                "sensitivity": pred.sensitivity,
+            }
         ev = self.ledger.append("claim", "agent:planner", payload)
         apply_mod.apply_event(self.index, ev, payload)
         self.index.commit()
@@ -696,11 +716,25 @@ class CandorSystem:
         apply_mod.apply_event(self.index, ev, payload)
         self.index.commit()
 
-    def resolve(self, claim_id: str, outcome: bool,
+    def resolve(self, claim_id: str, outcome: Optional[bool] = None,
+                value: Optional[str] = None,
                 verifier_code_hash: str = "", env_hash: str = "") -> int:
+        """Settle a claim. Crisp/frequency claims settle against a boolean
+        `outcome`; a categorical claim settles against the realised `value` (v*):
+        the verifier reports which value of the open set actually occurred, and
+        the surprisal −log P_frozen(v*) is scored against the distribution frozen
+        at claim time (design §4)."""
         row = self.index.one("SELECT * FROM claims WHERE id=?", (claim_id,))
         if row is None:
             raise KeyError(f"unknown claim {claim_id!r}")
+        oracle_kind = None
+        if row["verifier_id"]:
+            orow = self.index.one("SELECT kind FROM oracles WHERE id=?",
+                                  (row["verifier_id"],))
+            oracle_kind = orow["kind"] if orow else None
+        if row["predicted_dist_json"] is not None:
+            return self._resolve_categorical(
+                row, claim_id, value, oracle_kind, verifier_code_hash, env_hash)
         predicted = float(row["predicted_p"] if row["predicted_p"] is not None else 0.5)
         sensitivity = {
             r["fact_id"] or r["rule_id"]: float(r["sensitivity"])
@@ -709,16 +743,49 @@ class CandorSystem:
                 (claim_id,))
             if (r["fact_id"] or r["rule_id"])
         }
-        oracle_kind = None
-        if row["verifier_id"]:
-            orow = self.index.one("SELECT kind FROM oracles WHERE id=?",
-                                  (row["verifier_id"],))
-            oracle_kind = orow["kind"] if orow else None
         payload = {
             "claim_id": claim_id, "outcome": bool(outcome),
-            "surprisal": calibration_mod.surprisal(predicted, outcome),
+            "surprisal": calibration_mod.surprisal(predicted, bool(outcome)),
             "sensitivity": sensitivity,          # full vector, always logged (§4.4)
             "blame_target": self._blame_target(sensitivity),
+            "verifier_code_hash": verifier_code_hash,
+            "env_hash": env_hash,
+            "oracle_kind": oracle_kind,
+        }
+        ev = self.ledger.append("resolution", "verifier:harness", payload)
+        apply_mod.apply_event(self.index, ev, payload)
+        self.index.commit()
+        return ev.seq
+
+    def _resolve_categorical(self, row: Any, claim_id: str,
+                             value: Optional[str], oracle_kind: Optional[str],
+                             verifier_code_hash: str, env_hash: str) -> int:
+        """Settle a categorical claim against the realised value v* (design §4.1).
+
+        Surprisal = −log P_frozen(v*), read off the distribution frozen at claim
+        time. If v* was a SEEN value it scores against that value's slice; if v*
+        was NEVER seen at claim time it scores against the reserved unknown mass —
+        FINITE, not infinite. P(v*) also feeds the categorical calibration diagram
+        (recorded in _apply_resolution under the distinct predictor_class, I9),
+        and v* rides the payload for audit."""
+        if value is None:
+            raise ValueError(
+                "a categorical claim resolves against a realised value "
+                "(pass value=...), not a boolean outcome")
+        frozen = json.loads(row["predicted_dist_json"])
+        realized = str(value)
+        # The unseen slice is exactly what makes this well-defined for a value
+        # never observed at claim time (design §4.1) — not a zero-probability
+        # infinite-surprisal blow-up.
+        p_star = frozen["values"].get(realized)
+        if p_star is None:
+            p_star = frozen["unknown"]
+        payload = {
+            "claim_id": claim_id,
+            "outcome": True,                     # the realised value did occur
+            "realized_value": realized,          # audit — which value settled
+            "surprisal": calibration_mod.surprisal(float(p_star), True),
+            "predicted_p": float(p_star),        # P(v*), for calibration (I9)
             "verifier_code_hash": verifier_code_hash,
             "env_hash": env_hash,
             "oracle_kind": oracle_kind,

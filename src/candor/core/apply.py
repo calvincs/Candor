@@ -251,16 +251,22 @@ def _apply_demotion(idx: "Index", ev: "Event", payload: dict[str, Any]) -> None:
 
 
 def _apply_claim(idx: "Index", ev: "Event", payload: dict[str, Any]) -> None:
+    # A categorical claim freezes its full predicted DISTRIBUTION (design §4.1),
+    # not a scalar predicted_p; it is snapshot-pinned here so resolution can score
+    # the realised value's surprisal against it. NULL for crisp/frequency.
+    dist = payload.get("predicted_dist")
     idx.execute(
         "INSERT OR REPLACE INTO claims(id, stmt_json, frame, settlement, verifier_id, "
         "due_ts, predicted_p, predicted_ci_lo, predicted_ci_hi, model_snapshot, "
-        "predictor_class, certainty_class, resolved_ts, outcome, surprisal) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL)",
+        "predictor_class, certainty_class, resolved_ts, outcome, surprisal, "
+        "predicted_dist_json) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?)",
         (payload["claim_id"], canon_json(payload["stmt"]), payload["frame"],
          payload["settlement"], payload.get("verifier_id"), payload.get("due"),
          payload.get("predicted_p"), payload.get("ci_lo"), payload.get("ci_hi"),
          payload["model_snapshot"], payload["predictor_class"],
-         payload.get("certainty_class")))
+         payload.get("certainty_class"),
+         canon_json(dist) if dist is not None else None))
     for i, (comp, sens) in enumerate(sorted((payload.get("sensitivity") or {}).items())):
         idx.execute(
             "INSERT OR REPLACE INTO proof_steps(claim_id, step_no, rule_id, fact_id, "
@@ -279,6 +285,25 @@ def _apply_resolution(idx: "Index", ev: "Event", payload: dict[str, Any]) -> Non
         "UPDATE claims SET resolved_ts=?, outcome=?, surprisal=? WHERE id=?",
         (ev.ts, 1 if outcome else 0, payload.get("surprisal"), claim_id))
     if row is None:
+        return
+    # ── categorical settlement (design §4): the verifier reported a realised
+    # value v*, and the payload carries the multiclass surprisal −log P(v*) plus
+    # P(v*) itself (both frozen at resolve time against the claim's snapshot). It
+    # calibrates under the DISTINCT categorical predictor_class (I9 — never pools
+    # with binary) and scores per-source trust via one-vs-rest, not the binary
+    # two-coin scorer. No credit-assignment blame: a categorical fact is a leaf
+    # query, not a proof literal (decision 3).
+    if payload.get("realized_value") is not None:
+        calibration_mod.record(idx, row["frame"], row["settlement"],
+                               row["predictor_class"],
+                               float(payload.get("predicted_p") or 0.0),
+                               True, ev.ts)
+        if payload.get("oracle_kind") == "deterministic_total":
+            stmt = json.loads(row["stmt_json"])
+            fid = facts_mod.lookup(idx, stmt["pred"], stmt["args"])
+            if fid is not None:
+                reliability_mod.score_category_against_settlement(
+                    idx, fid, payload["realized_value"], row["frame"])
         return
     calibration_mod.record(idx, row["frame"], row["settlement"],
                            row["predictor_class"], float(row["predicted_p"] or 0.5),
@@ -477,7 +502,8 @@ _HASH_QUERIES: tuple[tuple[str, str], ...] = (
     ("oracles", "SELECT id, kind, impl_ref, code_hash, env_hash, n_trials, n_correct "
                 "FROM oracles ORDER BY id"),
     ("claims", "SELECT id, stmt_json, frame, settlement, predicted_p, model_snapshot, "
-               "resolved_ts, outcome FROM claims ORDER BY id"),
+               "resolved_ts, outcome, surprisal, predicted_dist_json "
+               "FROM claims ORDER BY id"),
     ("calibration", "SELECT frame, settlement, predictor_class, bucket, n, k, p_milli "
                     "FROM calibration ORDER BY frame, settlement, predictor_class, bucket"),
     ("open_questions", "SELECT id, kind, target_kind, target_id, residual_partition, "
