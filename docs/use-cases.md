@@ -1,6 +1,6 @@
 # Use cases
 
-Three patterns this substrate is actually for, each mapped to a runnable
+Five patterns this substrate is actually for, each mapped to a runnable
 example.
 
 ## 1. Agent memory that can be audited (and survive a bad source)
@@ -68,6 +68,14 @@ sweep separates three situations that look identical to an average:
   and a concrete suggested measurement, re-tested automatically when a new
   covariate starts being recorded.
 
+Two v0.6 upgrades sharpen this: the sweep also searches **frames you never
+logged** — hour-of-day and day-of-week from the event timestamps, the fact's
+own previous outcome, interactions of recorded keys — so "backups fail at
+03:00" is findable with an *empty* context dict; and admitted conditions
+**keep paying rent** — one whose direction reverses or goes stale on later
+observations is demoted through the same gate, and can only re-enter on fresh
+post-demotion evidence. See `examples/axiom_loops.py` for both.
+
 On its first run over a real agent's operational history this located a tool
 repair (0%→79% on 2026-04-30) and a search-reliability collapse (93%→38% on
 2026-04-22), both corroborated by the agent's own notes — and rejected two
@@ -109,6 +117,39 @@ as it guards binary facts. See `examples/categorical.py`.
 **Fits:** failure-mode classification, error-class and routing distributions,
 intent/label tracking where the label set is not closed.
 
+## 5. Goodhart watch: "did this stop being true because we started optimizing it?"
+
+**The problem.** A metric tracks a goal — until someone targets the metric,
+and the coupling silently collapses. Averaged monitoring sees "the metric got
+noisy"; what actually happened is that *acting* on the system changed what the
+old observations were evidence for.
+
+**The CANDOR shape.** Log interventions as `do:` context keys — a reserved
+prefix meaning "we were acting, not watching":
+
+```python
+m.observe({"pred": "metric_tracks_goal", "args": ["ctr"]}, ok,
+          ctx={"do:optimize_metric": "yes"}, actor="tool:monitor")
+```
+
+Three things follow. A guard discovered on a `do:` key is labeled
+**regime-dependent** — "the coupling holds only where the metric is *not* the
+target" is Goodhart's law found by name, not a generic condition. Any
+prediction that pools observations across the intervention boundary carries a
+`regime_mixed` caveat, so the marginal announces that it averages two
+different worlds (the per-regime numbers live in `distribution()`). And if
+nobody logged the intervention at all, the collapse still surfaces as a
+regime change located to a date. See `examples/axiom_loops.py` and the
+executable battery in `tests/claims/test_axiom_battery.py`.
+
+**The stated limit:** this is detection, not prophecy. Nothing here predicts
+what an intervention *will* change before post-intervention data exists —
+that needs a causal model, and the battery asserts that boundary so it stays
+a measured fact about the system.
+
+**Fits:** KPI/OKR instrumentation, reward-hacking watch for RL or agent
+loops, A/B systems where shipping the winner changes the population.
+
 ## Anti-use-cases (read before adopting)
 
 - **Not a vector database.** The optional dense ranker helps `recall`, but if
@@ -122,3 +163,7 @@ intent/label tracking where the label set is not closed.
 - **No native continuous channel.** Outcomes are binary (crisp/frequency) or
   open-vocabulary categorical (use case 4); *continuous* scalars (latencies,
   scores) still need binarizing or bucketing at the boundary.
+- **Not a causal-inference engine.** `do:` keys give interventions a
+  vocabulary (use case 5); they do not build a causal model. The system
+  labels regime dependence after the data shows it — it never anticipates an
+  intervention's effect in advance.

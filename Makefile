@@ -65,3 +65,5 @@ examples:
 	$(PY) examples/quickstart.py
 	$(PY) examples/source_reliability.py
 	$(PY) examples/regime_change.py
+	$(PY) examples/categorical.py
+	$(PY) examples/axiom_loops.py
