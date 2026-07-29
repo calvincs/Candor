@@ -23,6 +23,10 @@ N_BUCKETS = 10
 MIN_N_FOR_ALERT = 50          # §2: alerting requires n >= min_n per bucket
 ENGINE_VERSION = "candor-engine/0.2.0"
 DEFAULT_PREDICTOR_CLASS = "wmc-two-loop/v1"
+# The categorical leaf-query path is a DISTINCT predictor class so its
+# predictions never pool with the scalar wmc-two-loop path (I9) — a categorical
+# prediction is a distribution over an open vocabulary, not a scalar p.
+CATEGORICAL_PREDICTOR_CLASS = "categorical/v1"
 
 
 def bucket_of(p: float) -> int:
@@ -157,6 +161,19 @@ def snapshot_id(ledger_head: str, calib_map_hash: str,
     """I8: {ledger head hash, engine version, calibration map hash}, decodable."""
     return canon_json({"ledger_head": ledger_head, "engine_version": engine_version,
                        "calib_map_hash": calib_map_hash})
+
+
+def categorical_snapshot_id(ledger_head: str, calib_map_hash: str,
+                            alpha: float) -> str:
+    """I8 for the categorical leaf-query path (design §5). The CRP concentration
+    `alpha` is a read-time constant (like GAMMA / the epi priors): it never lives
+    in storage, so it must ride in the ENGINE VERSION or a re-tuned alpha would
+    silently reproduce a DIFFERENT distribution under the SAME snapshot id.
+    Folding it in (and the distinct predictor_class) means changing alpha changes
+    every categorical snapshot id, exactly the discipline the isotonic-map hash
+    already enforces for the scalar path."""
+    engine = f"{ENGINE_VERSION}+{CATEGORICAL_PREDICTOR_CLASS}(alpha={alpha!r})"
+    return snapshot_id(ledger_head, calib_map_hash, engine_version=engine)
 
 
 def parse_snapshot(snapshot: str) -> dict[str, str]:

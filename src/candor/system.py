@@ -74,6 +74,21 @@ class PredictOutcome:
     rejection_rate: float
 
 
+@dataclass(frozen=True)
+class CategoricalPrediction:
+    """predict()'s return for a categorical fact (design §2.4): a DISTRIBUTION
+    over an open vocabulary plus a first-class unknown mass — not a scalar p.
+
+    `values` maps each seen value to its {p, ci} slice in canonical order
+    (ORDER BY value); `unknown` is the never-seen mass with its own interval.
+    `Σ values[*].p + unknown.p == 1.0` exactly by construction (§2.1)."""
+    values: dict[str, counts_mod.CategoricalSlice]
+    unknown: counts_mod.CategoricalSlice
+    total_observations: int
+    snapshot_id: str
+    caveats: frozenset[str]
+
+
 class CandorSystem:
     """One store. Single writer to the gate, single sequencer for the ledger."""
 
@@ -800,13 +815,18 @@ class CandorSystem:
         return out
 
     # ── prediction (§3.9) ────────────────────────────────────────────────────
-    def predict(self, stmt: Mapping[str, Any], budget: int) -> PredictOutcome:
+    def predict(self, stmt: Mapping[str, Any], budget: int
+                ) -> "PredictOutcome | CategoricalPrediction":
         out = self._predict_with(self.index, self.closure(), stmt, budget,
                                  self._calib, self.ledger.head())
-        self._last_rejection_rate = out.rejection_rate
+        # A categorical prediction is a distribution, not a constrained WMC world,
+        # so it carries no rejection_rate; leave the last-seen scalar rate intact.
+        if isinstance(out, PredictOutcome):
+            self._last_rejection_rate = out.rejection_rate
         return out
 
-    def predict_at(self, stmt: Mapping[str, Any], snapshot_id: str) -> PredictOutcome:
+    def predict_at(self, stmt: Mapping[str, Any], snapshot_id: str
+                   ) -> "PredictOutcome | CategoricalPrediction":
         """I8: re-run a prediction at its recorded ledger position, pinned map."""
         snap = calibration_mod.parse_snapshot(snapshot_id)
         head = snap["ledger_head"]
@@ -865,9 +885,18 @@ class CandorSystem:
     def _predict_with(self, idx: Index, clo: closure_mod.Closure,
                       stmt: Mapping[str, Any], budget: int,
                       calib: calibration_mod.IsotonicMap,
-                      ledger_head: str) -> PredictOutcome:
+                      ledger_head: str) -> "PredictOutcome | CategoricalPrediction":
         pred = stmt["pred"]
         args = facts_mod.canonical_args(idx, pred, list(stmt["args"]))
+        # Categorical facts are LEAF QUERIES (design §3, decision 3): predict
+        # returns a full CategoricalPrediction distribution, never a scalar
+        # PredictOutcome, so branch BEFORE building the WMC problem. Everything
+        # from `problem = ...` down is the scalar path, byte-for-byte unchanged
+        # (additivity §6): no categorical code runs for a non-categorical fact.
+        fid = facts_mod.lookup(idx, pred, args) or fact_key(pred, args)
+        strow = idx.one("SELECT stmt_type FROM facts WHERE id=?", (fid,))
+        if strow is not None and strow["stmt_type"] == "categorical":
+            return self._predict_categorical(idx, fid, calib, ledger_head)
         problem = self._build_problem(idx, clo, pred, args)
         outcome = predict_mod.run(problem, budget)
         p = calib.apply(outcome.p)
@@ -876,6 +905,26 @@ class CandorSystem:
         return PredictOutcome(p, ci, dict(outcome.channels),
                               dict(outcome.sensitivity), outcome.mpe,
                               outcome.caveats, snapshot, outcome.rejection_rate)
+
+    def _predict_categorical(self, idx: Index, fact_id: str,
+                             calib: calibration_mod.IsotonicMap,
+                             ledger_head: str) -> CategoricalPrediction:
+        """The categorical leaf-query path (design §2.4). Composes the CRP
+        predictive over the per-value counts and wraps it with the snapshot id
+        (which folds in the concentration alpha, I8) and read-time caveats. The
+        C3 isotonic recalibration of a categorical distribution is future work, so
+        `calib` only feeds the snapshot id here, not the probabilities."""
+        post = counts_mod.category_posterior(idx, fact_id,
+                                             counts_mod.CATEGORICAL_ALPHA)
+        snapshot = calibration_mod.categorical_snapshot_id(
+            ledger_head, calib.hash, counts_mod.CATEGORICAL_ALPHA)
+        caveats: set[str] = set()
+        if post.total_observations == 0:
+            # Admitted but never observed: the whole predictive mass is unknown.
+            caveats.add("no_observations")
+        return CategoricalPrediction(post.values, post.unknown,
+                                     post.total_observations, snapshot,
+                                     frozenset(caveats))
 
     def _build_problem(self, idx: Index, clo: closure_mod.Closure, pred: str,
                        args: list[Any]) -> predict_mod.Problem:
@@ -941,13 +990,11 @@ class CandorSystem:
         row = idx.one("SELECT stmt_type, dispersion_flag, breadth_class FROM facts "
                       "WHERE id=?", (fact_id,))
         stmt_type = row["stmt_type"] if row else "crisp"
-        # C1 stores a categorical fact and folds it deterministically, but the
-        # Dirichlet/CRP posterior + CategoricalPrediction return type land in C2.
-        # Guard with a clear error rather than treating it as a scalar-p fact and
-        # returning a silent wrong answer (its counts live in fact_category_counts,
-        # so compose() would see zero epi/alea and hand back a bogus prior).
-        if stmt_type == "categorical":
-            raise NotImplementedError("categorical predict lands in C2")
+        # A categorical fact is a LEAF QUERY handled upstream in _predict_with by
+        # _predict_categorical (design §3, decision 3); it is never a proof
+        # literal in v1, so it never reaches _fact_state (whose scalar epi/alea
+        # composition would be meaningless for it — its counts live in
+        # fact_category_counts, not fact_counts).
         composed = counts_mod.compose(idx, [fact_id])
         epi, alea = counts_mod.posterior_params(composed, stmt_type)
         if row is None:

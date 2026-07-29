@@ -345,12 +345,17 @@ def test_checkpoint_accelerated_open_equals_full_replay_with_categorical(tmp_pat
     m2.close()
 
 
-# ══ predict is guarded until C2 ════════════════════════════════════════════════
+# ══ predict lands in C2 (the C1 guard is gone) ═════════════════════════════════
 
-def test_predict_on_a_categorical_fact_raises_until_c2(tmp_path):
+def test_predict_on_a_categorical_fact_returns_a_distribution_in_c2(tmp_path):
+    """C1 shipped a NotImplementedError guard; C2 removed it. predict() now
+    returns a CategoricalPrediction distribution (see test_categorical_c2.py for
+    the full posterior contract) rather than raising."""
+    from candor.system import CategoricalPrediction
     m = _categorical_store(tmp_path / "store")
     for v in ("captcha", "block"):
         m.observe(CAT_STMT, ctx={}, actor="tool:probe", value=v)
-    with pytest.raises(NotImplementedError, match="C2"):
-        m.predict(CAT_STMT, budget=1000)
+    out = m.predict(CAT_STMT, budget=1000)
+    assert isinstance(out, CategoricalPrediction)
+    assert set(out.values) == {"captcha", "block"}
     m.close()
