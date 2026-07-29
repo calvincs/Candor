@@ -149,6 +149,64 @@ def partition_by_key(observations: Iterable[tuple[dict[str, str], bool]],
     return {v: Group(n, k) for v, (n, k) in out.items()}
 
 
+#: The bucket name for observations that did NOT record a given context key — the
+#: honest "cannot attribute this to any value of the key" mass. A dunder so it can
+#: never collide with a real context value (values are plain strings).
+RESIDUAL_BUCKET = "__residual__"
+
+
+def outcome_breakdown(observations: Iterable[tuple[dict[str, str], bool]],
+                      key: str) -> dict[str, Group]:
+    """Per-value (n, k) tally for ONE recorded context key, plus a residual bucket.
+
+    Extends `partition_by_key` with a ``__residual__`` group: the observations
+    that did not record `key` at all — mass no value of the key can account for.
+    Deterministic and order-independent (integer count folds), so a replay of the
+    same observation set reproduces every (n, k) exactly.
+
+    General in the tallied *outcome*: it counts n and k where k sums a truthy
+    outcome, so a future categorical fact type reuses the identical shape to break
+    a chosen value's incidence down by context — only the meaning of "truthy"
+    changes, decided by the caller, not this helper. (No categorical support is
+    built here; the helper simply does not hard-block it.)
+    """
+    obs = list(observations)
+    groups = dict(partition_by_key(obs, key))
+    res_n = res_k = 0
+    for ctx, outcome in obs:
+        if key not in ctx:
+            res_n += 1
+            res_k += 1 if outcome else 0
+    if res_n:
+        groups[RESIDUAL_BUCKET] = Group(res_n, res_k)
+    return groups
+
+
+def explained_fraction(groups: Iterable[Group]) -> float:
+    """Correlation ratio η² — the share of a binary outcome's total variance a
+    categorical partition accounts for: between-group variance / total variance.
+
+    A simple, standard, deterministic decomposition over the SAME Group(n, k)
+    partitions the dispersion machinery already builds — NOT a new detector. It is
+    0 when a partition separates the outcome no better than chance (every group at
+    the pooled rate) and approaches 1 as the groups become internally homogeneous,
+    so `1 - explained_fraction` is the honest "no recorded variable accounts for
+    this" residual. A degenerate outcome (all-0 or all-1, zero total variance)
+    yields 0. Order-independent up to float reassociation; pass groups in a stable
+    order (e.g. sorted by value) for a bit-reproducible result.
+    """
+    usable = [g for g in groups if g.n > 0]
+    total_n = sum(g.n for g in usable)
+    if total_n == 0:
+        return 0.0
+    p = sum(g.k for g in usable) / total_n
+    total_var = p * (1.0 - p)
+    if total_var <= 0.0:
+        return 0.0
+    between = sum(g.n * ((g.k / g.n) - p) ** 2 for g in usable) / total_n
+    return min(1.0, between / total_var)
+
+
 def cusum_changepoint(series: Sequence[bool], threshold: float = CUSUM_THRESHOLD,
                       drift: float = CUSUM_DRIFT) -> Optional[int]:
     """Two-sided CUSUM on a Bernoulli series. Returns the first alarm index."""

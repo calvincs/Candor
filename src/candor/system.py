@@ -31,6 +31,7 @@ from .core.hashing import GENESIS
 from .core.index import Index
 from .core.ledger import Ledger, is_payload_hash
 from .periphery import conjecture as conjecture_mod
+from .periphery import curiosity as curiosity_stats_mod
 from .periphery import curiosity_engine as curiosity_mod
 from .periphery import embedder as embedder_mod
 from .periphery import extractor as extractor_mod
@@ -1039,6 +1040,128 @@ class CandorSystem:
             "source_diversity": keys,
             "derivation": {"status": derivation.status, "quality": derivation.quality,
                            "proof": derivation.proof},
+        }
+
+    def distribution(self, stmt: Mapping[str, Any]) -> dict[str, Any]:
+        """Read-time outcome breakdown for a flaky BINARY (crisp/frequency) fact.
+
+        A PURE projection over data the store already keeps — the fact's
+        observations, their recorded `obs_context`, the curiosity sweep's stored
+        verdict, and any admitted conditioning guard. It writes nothing, moves no
+        count, changes no closure_hash, and never runs predict(): the scalar
+        prediction is byte-identical whether or not this is ever called. It is the
+        honest companion to the `unstable` caveat — instead of only saying a fact
+        is flaky, it says *how* it splits by context and how much of the spread no
+        recorded variable accounts for.
+
+        Shape::
+
+            {
+              "found": bool,              # False (fact_id None) if the stmt names no fact
+              "fact_id": str | None,
+              "stmt_type": "crisp" | "frequency",
+              "n_obs": int,               # observations attributed to the fact
+              "flaky": bool,              # dispersed, or (crisp) vote-alternating
+              "dispersion_flag": bool,    # the stored sweep verdict
+              "modes": {                  # PART 1 — per recorded context key
+                <key>: {
+                  <value>: {"p": <true-rate>, "n": <count>},
+                  ...,
+                  "__residual__": {"p": .., "n": ..}  # obs that did NOT record <key>
+                }, ...
+              },
+              "residual": {               # PART 2 — the unexplained "unknown" share
+                "conditioning_key": <key> | None,  # the admitted guard's variable, if any
+                "explained": float,       # η² of the guard partition; 0 with no guard
+                "unexplained": float,     # 1 - explained when dispersed, else 0
+                "dispersion_stat": float | None,   # stored Tarone overdispersion Z
+              },
+            }
+
+        `modes` is built by the reusable `curiosity.outcome_breakdown` helper
+        (a future categorical fact type breaks its value distribution down with
+        the same helper). `explained` is the correlation ratio η² of an *admitted*
+        guard's partition — the share of the binary outcome's variance the guard
+        variable accounts for; with no admitted guard it is 0 and the whole
+        dispersion is unexplained. `dispersion_stat` is surfaced raw for reference,
+        not recomputed. A non-dispersed fact returns trivial modes and a zero
+        residual.
+        """
+        fid = facts_mod.lookup(self.index, stmt["pred"], list(stmt["args"]))
+        if fid is None:
+            return {"found": False, "fact_id": None, "stmt_type": None,
+                    "n_obs": 0, "flaky": False, "dispersion_flag": False,
+                    "modes": {}, "residual": {"conditioning_key": None,
+                                              "explained": 0.0, "unexplained": 0.0,
+                                              "dispersion_stat": None}}
+        row = self.index.one(
+            "SELECT stmt_type, dispersion_flag FROM facts WHERE id=?", (fid,))
+        stmt_type = row["stmt_type"]
+        dispersion_flag = bool(row["dispersion_flag"])
+        ids = self._alias_ids(fid)
+
+        # All observations attributed to the fact (alias-unioned), in a stable
+        # order so the crisp vote sequence matches what _fact_state feeds predict.
+        placeholders = ",".join("?" * len(ids))
+        rows = self.index.query(
+            f"SELECT event_seq, outcome, actor, grade, context_sig FROM observations "
+            f"WHERE fact_id IN ({placeholders}) "
+            f"ORDER BY actor, context_sig, event_seq", ids)
+        ctx_rows = self.index.query(
+            f"SELECT oc.event_seq AS event_seq, oc.key AS key, oc.value AS value "
+            f"FROM obs_context oc JOIN observations o ON o.event_seq = oc.event_seq "
+            f"WHERE o.fact_id IN ({placeholders})", ids)
+        by_seq: dict[int, dict[str, str]] = {}
+        for r in ctx_rows:
+            by_seq.setdefault(int(r["event_seq"]), {})[r["key"]] = r["value"]
+        obs = [(by_seq.get(int(r["event_seq"]), {}), bool(r["outcome"]))
+               for r in rows]
+
+        # PART 1 — per-context-key breakdown, via the reusable helper.
+        keys = sorted({k for ctx, _ in obs for k in ctx})
+        modes: dict[str, Any] = {}
+        for key in keys:
+            groups = curiosity_stats_mod.outcome_breakdown(obs, key)
+            modes[key] = {v: {"p": g.k / g.n, "n": g.n}
+                          for v, g in sorted(groups.items())}
+
+        # A crisp fact whose votes alternate is flaky even when the sweep's
+        # overdispersion test stays silent (H8b) — the same signal predict()
+        # surfaces as `unstable`. Pure function of the votes, so it replays.
+        flaky_votes = False
+        if stmt_type == "crisp":
+            votes = tuple((r["actor"], int(r["outcome"]), int(r["grade"]),
+                           r["context_sig"]) for r in rows)
+            flaky_votes = bool(votes) and predict_mod.is_flaky(votes)
+        dispersed = dispersion_flag or flaky_votes
+
+        # PART 2 — the unexplained "unknown" residual. An admitted guard names the
+        # conditioning variable; η² over its partition is the explained share.
+        cond_key = None
+        for r in self.index.query(
+                "SELECT body_json FROM candidates WHERE kind='guard' "
+                "AND status='admitted' ORDER BY event_seq"):
+            body = json.loads(r["body_json"])
+            if body.get("target_fact") in ids:
+                cond_key = body.get("conditioning_key")   # most recent match wins
+        explained = 0.0
+        if cond_key is not None and cond_key in keys:
+            value_groups = [g for _, g in sorted(
+                curiosity_stats_mod.partition_by_key(obs, cond_key).items())]
+            explained = curiosity_stats_mod.explained_fraction(value_groups)
+        unexplained = (1.0 - explained) if dispersed else 0.0
+        oq = self.index.one(
+            "SELECT dispersion_stat FROM open_questions "
+            "WHERE kind='dispersion' AND target_id=?", (fid,))
+        dispersion_stat = oq["dispersion_stat"] if oq is not None else None
+
+        return {
+            "found": True, "fact_id": fid, "stmt_type": stmt_type,
+            "n_obs": len(rows), "flaky": dispersed,
+            "dispersion_flag": dispersion_flag, "modes": modes,
+            "residual": {"conditioning_key": cond_key, "explained": explained,
+                         "unexplained": unexplained,
+                         "dispersion_stat": dispersion_stat},
         }
 
     def _gate_run_for(self, fact_id: str) -> Optional[str]:
