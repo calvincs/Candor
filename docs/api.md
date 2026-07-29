@@ -43,6 +43,14 @@ the latest observations after a `run_gate()` or a reopen; call it before
 comparing closure hashes across processes (see
 [architecture.md](architecture.md#the-curiosity-engine-stage-5)).
 
+It also opens with the **prospective audit** (v0.6 Δ11): every admitted guard is
+scored on the observations that arrived *after* its admission, and one whose
+direction reverses (at the §3.4 hysteresis bar) or stops beating chance (on
+twice the entry evidence) is **demoted** through the ledger — rule out of the
+closure, candidate row closed, read paths silent. Demotions appear in the
+returned runs as `status: "demoted"`. Re-entry is judged on post-demotion
+evidence only, so a demoted guard returns on new data or not at all.
+
 ### `observe(stmt, outcome=None, ctx, actor, value=None, confidence=None) -> event_seq`
 An attributed outcome report. `ctx` is free-form key/value ambient state —
 **log wide**; it's the raw material for finding missing variables later.
@@ -51,6 +59,15 @@ keeps the raw value in the event payload. For a **categorical** fact, pass
 `value="captcha"` (the realised category) instead of `outcome` — which field is
 authoritative is decided at fold time by the fact's `stmt_type`. `observe_batch([...])`
 for bulk.
+
+Two reserved `ctx` conventions (v0.6): keys prefixed **`do:`** record that the
+agent was *acting on* the world, not merely watching it (Δ13) — a guard found
+on one is labeled regime dependence, and predictions pooling across mixed `do:`
+regimes carry a `regime_mixed` caveat. Keys prefixed `derived:` are
+system-synthesized (Δ10) and never yours to write. Even with an empty `ctx` the
+sweep still searches the synthesized frames — hour-of-day and day-of-week from
+the event timestamp, the fact's own previous outcome, and pairwise interactions
+of whatever keys you did record.
 
 ### `claim(stmt, frame, criterion, due) -> claim_id | "Refused"`
 Registers a prediction to be settled. `frame` is `internal`/`external`;
@@ -100,9 +117,10 @@ re-checked.
 ### `predict(stmt, budget) -> PredictOutcome`
 `p`, `ci`, `channels` (epistemic vs aleatoric spread), `sensitivity` (which
 fact flips the conclusion), `mpe`, `caveats` (e.g. `shared_provenance`,
-`narrow_breadth`, `unstable` for a flaky fact), `rejection_rate` (constraint
-tension), and `snapshot_id`. `predict_at(stmt, snapshot_id)` re-runs at a
-recorded ledger position and reproduces the number exactly.
+`narrow_breadth`, `unstable` for a flaky fact, `regime_mixed` when the number
+pools observations across a `do:` intervention boundary — Δ13), `rejection_rate`
+(constraint tension), and `snapshot_id`. `predict_at(stmt, snapshot_id)` re-runs
+at a recorded ledger position and reproduces the number exactly.
 
 ### `predict` on a categorical fact -> `CategoricalPrediction`
 When `stmt` names a categorical fact, `predict` returns a **distribution**, not a
@@ -121,17 +139,33 @@ bit-for-bit and `alpha` rides the snapshot id (see the
 A pure read-time breakdown of a flaky **binary** (crisp/frequency) fact — it
 writes nothing, moves no count, changes no `closure_hash`, and never runs
 `predict`. `modes` splits the true-rate by each recorded context key (with a
-`__residual__` bucket for observations that didn't record it); `residual` reports
-how much of the spread an admitted guard **explains** (`explained` = the η²
-correlation ratio of its partition) versus the honest `unexplained` remainder.
-It is the companion to the `unstable` caveat: not just *that* a fact is flaky,
-but *how* it splits by context and how much no recorded variable accounts for.
+`__residual__` bucket for observations that didn't record it); `derived_modes`
+(Δ10) does the same for the synthesized frames (`derived:hour`, `derived:prev`,
+…); `residual` reports how much of the spread an admitted guard **explains**
+(`explained` = the η² correlation ratio of its partition, computed on the
+augmented projection when the guard's key is derived) versus the honest
+`unexplained` remainder. It is the companion to the `unstable` caveat: not just
+*that* a fact is flaky, but *how* it splits by context and how much no recorded
+variable accounts for.
 
 ### `derive(goal, budget) -> DeriveOutcome`
 Three-valued, honestly: `proof` (with a kernel-checked derivation and a
 quality tag — `proof`, `proof-modulo-unknown-context`, or `conjecture`),
 `not_entailed` (**only** when the search space was exhausted), or
 `budget_exceeded` (truncated ⇒ unknown — never conflated with absence).
+
+### `conjecture(goal, sim_budget, commit=False) -> [conjectures]`
+Analogical proposals over behavioural signatures (§4.3): for a goal `P(args)`,
+a predicate that *fires like* `P` and already holds at those args is offered as
+`P(args)` by analogy — never typed as a proof, blind below the signature floor,
+refused above the similarity budget. With **`commit=True`** (v0.6 Δ12) each
+proposal is filed as a **claim** by `agent:conjecture`: `predicted_p` is the
+analog's own earned probability (the transfer moves an audited number —
+similarity is not a probability), under the distinct `conjecture/v1` predictor
+class so the analogy engine's calibration curve is measured on its own (I9).
+`resolve(claim_id, outcome=True)` then asserts the goal as an ordinary fact
+candidate through the gate — postulate, validate, implement, in that order and
+never out of it.
 
 ### `recall(query, budget) -> [entries]`
 Prose retrieval over the evidence tier: BM25 + RM3 expansion + sub-token
